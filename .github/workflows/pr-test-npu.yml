@@ -23,7 +23,7 @@ jobs:
         github.event.pull_request.draft == false
     runs-on: linux-aarch64-a3-16
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-a3-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-a3-ubuntu22.04-py3.11
     steps:
       - name: Clean git config
         run: |
@@ -72,13 +72,19 @@ jobs:
           HCCL_BUFFSIZE: 2000
         run: |
           python3 $GITHUB_WORKSPACE/tests/python/deepep/test_fused_deep_moe.py
+          python3 $GITHUB_WORKSPACE/tests/python/deepep/test_fused_deep_moe.py --num-tokens 2
+          python3 $GITHUB_WORKSPACE/tests/python/deepep/test_fused_deep_moe.py --topk-drop-col 3
+          python3 $GITHUB_WORKSPACE/tests/python/deepep/test_fused_deep_moe.py --topk-drop-prob 0.3
+          python3 $GITHUB_WORKSPACE/tests/python/deepep/test_fused_deep_moe.py --num-tokens 2 --topk-drop-col 2
+          python3 $GITHUB_WORKSPACE/tests/python/deepep/test_fused_deep_moe.py --num-tokens 2 --topk-drop-col 3 --num-experts 16
+          python3 $GITHUB_WORKSPACE/tests/python/deepep/test_fused_deep_moe.py --num-tokens 4 --topk-drop-col 1 --num-experts 32
 
   test-build-deepep:
     if: (github.repository == 'sgl-project/sgl-kernel-npu' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
     runs-on: linux-aarch64-a3-16
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-a3-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-a3-ubuntu22.04-py3.11
     steps:
       - name: Clean git config
         run: |
@@ -127,6 +133,12 @@ jobs:
           HCCL_BUFFSIZE: 2000
         run: |
           python3 $GITHUB_WORKSPACE/tests/python/deepep/test_fused_deep_moe.py
+          python3 $GITHUB_WORKSPACE/tests/python/deepep/test_fused_deep_moe.py --num-tokens 2
+          python3 $GITHUB_WORKSPACE/tests/python/deepep/test_fused_deep_moe.py --topk-drop-col 3
+          python3 $GITHUB_WORKSPACE/tests/python/deepep/test_fused_deep_moe.py --topk-drop-prob 0.3
+          python3 $GITHUB_WORKSPACE/tests/python/deepep/test_fused_deep_moe.py --num-tokens 2 --topk-drop-col 2
+          python3 $GITHUB_WORKSPACE/tests/python/deepep/test_fused_deep_moe.py --num-tokens 2 --topk-drop-col 3 --num-experts 16
+          python3 $GITHUB_WORKSPACE/tests/python/deepep/test_fused_deep_moe.py --num-tokens 4 --topk-drop-col 1 --num-experts 32
 
   finish:
     if: always()

@@ -21,6 +21,7 @@ from utils import (
 # noinspection PyShadowingNames
 def test_main(
     args: argparse.Namespace,
+    num_local_ranks: int,
     local_rank: int,
     num_ranks: int,
     rank: int,
@@ -31,6 +32,7 @@ def test_main(
     num_tokens, hidden = args.num_tokens, args.hidden
     num_topk, num_experts = args.num_topk, args.num_experts
     enable_diagnose = args.enable_diagnose
+    num_servers = num_ranks // num_local_ranks
 
     assert num_experts % num_ranks == 0
     if local_rank == 0:
@@ -113,16 +115,18 @@ def test_main(
             count, dtype=torch.long, device="npu"
         )
     token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
-    is_token_in_rank = token_idx_in_rank >= 0
+    is_token_in_rank = (token_idx_in_rank >= 0).to(torch.int)
     gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
     dist.all_reduce(gbl_num_tokens_per_rank, group=group)
-    try:
-        try:
-            return_values = buffer.get_dispatch_layout(topk_idx, num_experts)
-        except Exception as e:
-            print(f"Error occurred while calling get_dispatch_layout: {e}")
-            raise
 
+    t = bench(lambda: buffer.get_dispatch_layout(topk_idx, num_experts))[0]
+    print(f"[layout] Kernel performance: {t * 1000:.3f} ms", flush=True)
+    print("", flush=True)
+    dist.barrier()
+    time.sleep(1)
+
+    try:
+        return_values = buffer.get_dispatch_layout(topk_idx, num_experts)
         (
             ref_num_tokens_per_rank,
             _,
@@ -145,12 +149,6 @@ def test_main(
             raise
     except Exception as e:
         print(f"An error occurred: {e}")
-
-    t = bench(lambda: buffer.get_dispatch_layout(topk_idx, num_experts))[0]
-    print(f"[layout] Kernel performance: {t * 1000:.3f} ms", flush=True)
-    print("", flush=True)
-    dist.barrier()
-    time.sleep(1)
 
     # Config
     buffer_size = 256
@@ -388,7 +386,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     print(f"[Rank {rank}] Buffer created OK.", flush=True)
     torch.manual_seed(rank)
 
-    test_main(args, local_rank, num_ranks, rank, buffer, group)
+    test_main(args, num_local_ranks, local_rank, num_ranks, rank, buffer, group)
     if local_rank == 0:
         print("", flush=True)
 
