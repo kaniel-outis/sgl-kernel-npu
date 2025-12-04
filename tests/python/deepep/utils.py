@@ -55,7 +55,7 @@ def inplace_unique(x: torch.Tensor, num_slots: int):
     x[:, :valid_len] = sorted_bin_idx[:, :valid_len]
 
 
-def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
+def bench(fn, num_warmups: int = 50, num_tests: int = 100, post_fn=None):
     device = torch.device("npu")
     torch.npu.synchronize()
 
@@ -87,6 +87,89 @@ def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
         torch.npu.synchronize()
         elapsed_time = start.elapsed_time(end) / 1e3  # ms -> s
         times.append(elapsed_time)
+        # print(f"[bench] iteration {_}: {elapsed_time*1e6:.3f} us")
+
+    times = np.array(times[1:])  # Remove the first timing
+    return np.average(times), np.min(times), np.max(times)
+
+
+def bench_profile(
+    fn,
+    num_warmups: int = 50,
+    num_tests: int = 100,
+    post_fn=None,
+):
+    device = torch.device("npu")
+    torch.npu.synchronize()
+    # Flush L2 cache with 256 MB data
+    cache = torch.empty(int(256e6 // 4), dtype=torch.int32, device=device)
+
+    # Warmup
+    for _ in range(num_warmups):
+        fn()
+
+    # Flush L2 cache
+    cache.zero_()
+    torch.npu.synchronize()
+
+    # Timing
+    times = []
+    for _ in range(num_tests):
+        # torch.npu.synchronize()
+        # start = torch.npu.Event(enable_timing=True)
+        # end = torch.npu.Event(enable_timing=True)
+        # start.record()
+        fn()
+        # end.record()
+
+        if post_fn is not None:
+            post_fn()
+
+        # torch.npu.synchronize()
+        # elapsed_time = start.elapsed_time(end) / 1e3  # ms -> s
+        elapsed_time = 1.0
+        times.append(elapsed_time)
+        # print(f"[bench] iteration {_}: {elapsed_time*1e6:.3f} us")
+
+    times = np.array(times[1:])  # Remove the first timing
+    return np.average(times), np.min(times), np.max(times)
+
+
+def bench_profile_cache(
+    cache_filler,
+    fn,
+    num_warmups: int = 50,
+    num_tests: int = 100,
+    post_fn=None,
+):
+    device = torch.device("npu")
+    torch.npu.synchronize()
+
+    # Warmup
+    for _ in range(num_warmups):
+        fn()
+
+    torch.npu.synchronize()
+
+    # Timing
+    times = []
+    for _ in range(num_tests):
+        # torch.npu.synchronize()
+        # start = torch.npu.Event(enable_timing=True)
+        # end = torch.npu.Event(enable_timing=True)
+        cache_filler += 1
+        # start.record()
+        fn()
+        # end.record()
+
+        if post_fn is not None:
+            post_fn()
+
+        # torch.npu.synchronize()
+        # elapsed_time = start.elapsed_time(end) / 1e3  # ms -> s
+        elapsed_time = 1.0
+        times.append(elapsed_time)
+        # print(f"[bench] iteration {_}: {elapsed_time*1e6:.3f} us")
 
     times = np.array(times[1:])  # Remove the first timing
     return np.average(times), np.min(times), np.max(times)
@@ -153,6 +236,9 @@ class suppress_stdout_stderr:
         self.errnull_file.close()
 
 
+import time
+
+
 def bench_kineto(
     fn,
     kernel_names: Union[str, tuple],
@@ -162,6 +248,9 @@ def bench_kineto(
     barrier_comm_profiling: bool = False,
     num_kernels_per_period: int = 1,
 ):
+    global global_iter_id
+    global_iter_id = 0
+
     # Profile
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     with suppress():
@@ -170,27 +259,37 @@ def bench_kineto(
             activities=[torch_npu.profiler.ProfilerActivity.NPU], schedule=schedule
         ) as prof:
             for i in range(2):
-                # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
+
+                # barrier to remove launch overhead
                 if barrier_comm_profiling:
                     lhs = torch.randn((8192, 8192), dtype=torch.float, device="npu")
                     rhs = torch.randn((8192, 8192), dtype=torch.float, device="npu")
                     lhs @ rhs
                     dist.all_reduce(torch.ones(1, dtype=torch.float, device="npu"))
+
+                # --- NEW: print each iteration time ---
                 for _ in range(num_tests):
+                    t0 = time.time()
                     fn()
+                    torch.npu.synchronize()
+                    t1 = time.time()
+
+                    print(
+                        f"[bench_kineto] iter {global_iter_id}: {(t1 - t0) * 1e6:.2f} us"
+                    )
+                    global_iter_id += 1
+                # ---------------------------------------
+
                 torch.npu.synchronize()
                 prof.step()
 
-    # Parse the profiling table
+    # Parse profiler JSON
     assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
     is_tuple = isinstance(kernel_names, tuple)
 
     kernel_names = (kernel_names,) if not is_tuple else kernel_names
     assert all(isinstance(name, str) for name in kernel_names)
-    # Expand the kernels by periods
 
-    # If the json file exists, `torch_npu.profiler.export_chrome_trace` will use the append write mode,
-    # which will cause problems with the json format, so here we use a random file name instead of creating a temporary file
     temp_path = Path(tempfile.gettempdir()) / f"trace_{uuid.uuid4().hex}.json"
     prof.export_chrome_trace(temp_path)
     profile_data = json.loads(Path(temp_path).read_text())
@@ -202,6 +301,7 @@ def bench_kineto(
         assert len(events) > 0, f"Kernel '{kernel_name}' not found in trace"
         events = sorted(events, key=lambda event: event["ts"])
         durations = [event["dur"] / 1e6 for event in events]
+
         if num_kernels_per_period > 1:
             assert len(durations) % num_kernels_per_period == 0
             num_kernel_patterns = len(durations) // num_kernels_per_period
@@ -215,13 +315,11 @@ def bench_kineto(
             num_kernel_patterns = len(durations)
             kernel_durations.append(sum(durations) / num_kernel_patterns)
 
-    # Save chrome traces
     if trace_path is not None:
         prof.export_chrome_trace(trace_path)
 
     os.unlink(temp_path)
 
-    # Return execution durations
     return kernel_durations if is_tuple else kernel_durations[0]
 
 

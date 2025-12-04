@@ -996,6 +996,8 @@ std::vector<at::Tensor> Buffer::fused_deep_moe(const at::Tensor &x, const at::Te
     int64_t num_local_experts = is_shared_expert ? 1 : num_experts / (num_ranks - shared_expert_rank_num);
     at::Tensor ep_recv_count = at::empty({num_local_experts * num_ranks}, expert_ids.options());
 
+    std::cout << "  Scalar Type: " << gmm1_permuted_weight.scalar_type() << std::endl;  // 数据类型
+    std::cout << "  Dim: " << gmm1_permuted_weight.dim() << std::endl;                  // 维度数
     EXEC_NPU_CMD(aclnnFusedDeepMoe,
                  // input
                  new_x, this->new_topk_idx, gmm1_permuted_weight, gmm1_permuted_weight_scale, gmm2_weight,

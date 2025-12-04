@@ -20,6 +20,7 @@ else()
     message(WARNING "Failed to copy moe_distribute_base.h")
 endif()
 
+# logs
 add_ops_compile_options(ALL OPTIONS -DASCENDC_DUMP=0 --cce-auto-sync=off)
 
 add_kernels_compile()

@@ -179,12 +179,12 @@ static ge::graphStatus CheckData(const char *nodeName, FusedDeepMoeTilingData &t
         OP_TILING_CHECK(globalBatchSize % epRankSize > 0,
                         OP_LOGE(nodeName, "globalBatchSize must be divisible by epRankSize."), return ge::GRAPH_FAILED);
     }
-    uint32_t moeExpertNumPerRank = tilingData.disGmmDeqSwigluQuantGmmDeqComInfo.moeExpertNumPerRank;
-    uint32_t recvAivNum = tilingData.disGmmDeqSwigluQuantGmmDeqComInfo.aivNum / 2;
-    OP_TILING_CHECK(
-        moeExpertNumPerRank > recvAivNum,
-        OP_LOGE(nodeName, "moeExpertNumPerRank must <= (aivNum/2)(%u), but got %u", recvAivNum, moeExpertNumPerRank),
-        return ge::GRAPH_FAILED);
+    //    uint32_t moeExpertNumPerRank = tilingData.disGmmDeqSwigluQuantGmmDeqComInfo.moeExpertNumPerRank;
+    //    uint32_t recvAivNum = tilingData.disGmmDeqSwigluQuantGmmDeqComInfo.aivNum / 2;
+    //    OP_TILING_CHECK(
+    //        moeExpertNumPerRank > recvAivNum,
+    //        OP_LOGE(nodeName, "moeExpertNumPerRank must <= (aivNum/2)(%u), but got %u", recvAivNum,
+    //        moeExpertNumPerRank), return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -220,6 +220,8 @@ static ge::graphStatus GetAttrAndSetTilingData(gert::TilingContext *context, con
     OP_TILING_CHECK(moeExpertNum % (epRankSize - sharedExpertRankNum) != 0,
                     OP_LOGE(nodeName, "moeExpertNum must be divisible by (epRankSize - sharedExpertRankNum)."),
                     return ge::GRAPH_FAILED);
+//    OP_TILING_CHECK(moeExpertNumPerRank > RECV_AIV_NUM,
+//                    OP_LOGE(nodeName, "moeExpertNumPerRank must <= %d.", RECV_AIV_NUM), return ge::GRAPH_FAILED);
 #endif
 
     groupEp = std::string(groupEpPtr);

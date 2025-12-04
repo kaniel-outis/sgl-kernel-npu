@@ -556,7 +556,13 @@ public:
         aicSetFunc1 = {statusDataSpaceGm + SOFT_SYNC_OFFSET,
                        static_cast<uint8_t>(aicNum + AscendC::GetBlockIdx())};  // AIV等待的信息在后一半
         uint32_t target = 1;
-        for (uint32_t groupIdx = 0; groupIdx < localExpertNum; ++groupIdx) {
+
+        uint32_t numGroups = 4;  // 4 组专家
+        uint32_t numExpertPerGroup = moeExpertNumPerRank / numGroups;
+        AscendC::printf("fuck moeExpertNumPerRank = %ld, numExpertPerGroup = %ld\n", moeExpertNumPerRank,
+                        numExpertPerGroup);
+        //        return; //TDS
+        for (uint32_t groupIdx = 0; groupIdx < numGroups; ++groupIdx) {
             groupTokenNumStateTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + GROUP_TOKEN_NUM_OFFSET) +
                                                      groupIdx * GROUP_INFO_SIZE);
             // 等待AIV的token收齐信号后，再往下走
@@ -565,66 +571,72 @@ public:
                 AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                                   AscendC::DcciDst::CACHELINE_OUT>(groupTokenNumStateTensor);
                 __asm__ __volatile__("");
-                if (groupTokenNumStateTensor.GetValue(0) == coreNumPerGroup * vToCFlag) {
+                if (groupTokenNumStateTensor.GetValue(0) == 6 * vToCFlag) {
                     break;
                 }
             }
 
-            uint32_t currentM = groupTokenNumStateTensor.GetValue(GROUP_TOKEN_COUNT);
-            GemmCoord inGroupProblemShape{currentM, params.problemShape.n(), params.problemShape.k()};
+            for (uint32_t expertIdInGroup = 0; expertIdInGroup < numExpertPerGroup; ++expertIdInGroup) {  // TDS
 
-            LayoutA layoutA = params.layoutA.GetTileLayout(inGroupProblemShape.GetCoordMK());
-            LayoutB layoutB = params.layoutB;
+                uint32_t currentM = groupTokenNumStateTensor.GetValue(GROUP_TOKEN_COUNT + expertIdInGroup);
+                AscendC::printf("groupIdx = %ld, expertIdInGroup = %ld, currentM =%d \n", groupIdx, expertIdInGroup,
+                                currentM);
+                GemmCoord inGroupProblemShape{currentM, params.problemShape.n(), params.problemShape.k()};
 
-            blockScheduler.Update(inGroupProblemShape, MakeCoord(L1TileShape::M, L1TileShape::N));
-            uint32_t coreLoops = blockScheduler.GetCoreLoops();
+                LayoutA layoutA = params.layoutA.GetTileLayout(inGroupProblemShape.GetCoordMK());
+                LayoutB layoutB = params.layoutB;
 
-            // Determine the starting loopIdx of the current core under the current groupIdx
-            uint32_t startLoopIdx = ((aicIdx < startCoreIdx) ? (aicIdx + aicNum) : aicIdx) - startCoreIdx;
-            // Loop through the matmul of each groupIdx
-            for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += aicNum) {
-                // Compute block location
-                GemmCoord blockCoord = blockScheduler.GetBlockCoord(loopIdx);
-                GemmCoord actualBlockShape = blockScheduler.GetActualBlockShape(blockCoord);
+                blockScheduler.Update(inGroupProblemShape, MakeCoord(L1TileShape::M, L1TileShape::N));
+                uint32_t coreLoops = blockScheduler.GetCoreLoops();
 
-                // 使用软同步
-                Callback callbackBeforeFixpipe{};
-                if (stageUsed == WORKSPACE_STAGES) {
-                    aicWaitFunc1 = {statusDataSpaceGm + SOFT_SYNC_OFFSET, static_cast<uint8_t>(AscendC::GetBlockIdx()),
-                                    target};  // AIC等待的信号在前24个
-                    target += 1;
-                    callbackBeforeFixpipe = MakeCallback(&aicWaitFunc1);
-                } else {
-                    ++stageUsed;
+                // Determine the starting loopIdx of the current core under the current groupIdx
+                uint32_t startLoopIdx = ((aicIdx < startCoreIdx) ? (aicIdx + aicNum) : aicIdx) - startCoreIdx;
+                // Loop through the matmul of each groupIdx
+                for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += aicNum) {
+                    // Compute block location
+                    GemmCoord blockCoord = blockScheduler.GetBlockCoord(loopIdx);
+                    GemmCoord actualBlockShape = blockScheduler.GetActualBlockShape(blockCoord);
+
+                    // 使用软同步
+                    Callback callbackBeforeFixpipe{};
+                    if (stageUsed == WORKSPACE_STAGES) {
+                        aicWaitFunc1 = {statusDataSpaceGm + SOFT_SYNC_OFFSET,
+                                        static_cast<uint8_t>(AscendC::GetBlockIdx()), target};  // AIC等待的信号在前24个
+                        target += 1;
+                        callbackBeforeFixpipe = MakeCallback(&aicWaitFunc1);
+                    } else {
+                        ++stageUsed;
+                    }
+                    Callback callbackAfterFixpipe = MakeCallback(&aicSetFunc1);
+
+                    // Compute initial location in logical coordinates
+                    MatrixCoord offsetA{blockCoord.m() * L1TileShape::M, blockCoord.k() * L1TileShape::K};
+                    MatrixCoord offsetB{blockCoord.k() * L1TileShape::K, blockCoord.n() * L1TileShape::N};
+                    MatrixCoord offsetC{(stageId * aicNum + aicIdx) * L1TileShape::M, 0};
+                    int64_t gmOffsetA = layoutA.GetOffset(offsetA);
+                    int64_t gmOffsetB = layoutB.GetOffset(offsetB);
+                    int64_t gmOffsetC = layoutC.GetOffset(offsetC);
+
+                    // Compute block-scoped matrix multiply-add
+                    if constexpr (BlockMmad::DispatchPolicy::ASYNC) {
+                        blockMmad(gmA[gmGroupOffsetA + gmOffsetA], layoutA, gmB[gmGroupOffsetB + gmOffsetB], layoutB,
+                                  gmC[gmOffsetC], layoutC, actualBlockShape, callbackBeforeFixpipe,
+                                  callbackAfterFixpipe);
+                    } else {
+                        callbackBeforeFixpipe();
+                        blockMmad(gmA[gmGroupOffsetA + gmOffsetA], layoutA, gmB[gmGroupOffsetB + gmOffsetB], layoutB,
+                                  gmC[gmOffsetC], layoutC, actualBlockShape);
+                        callbackAfterFixpipe();
+                    }
+
+                    stageId = (stageId + 1 < WORKSPACE_STAGES) ? (stageId + 1) : 0;
                 }
-                Callback callbackAfterFixpipe = MakeCallback(&aicSetFunc1);
 
-                // Compute initial location in logical coordinates
-                MatrixCoord offsetA{blockCoord.m() * L1TileShape::M, blockCoord.k() * L1TileShape::K};
-                MatrixCoord offsetB{blockCoord.k() * L1TileShape::K, blockCoord.n() * L1TileShape::N};
-                MatrixCoord offsetC{(stageId * aicNum + aicIdx) * L1TileShape::M, 0};
-                int64_t gmOffsetA = layoutA.GetOffset(offsetA);
-                int64_t gmOffsetB = layoutB.GetOffset(offsetB);
-                int64_t gmOffsetC = layoutC.GetOffset(offsetC);
+                gmGroupOffsetA += inGroupProblemShape.m() * inGroupProblemShape.k();
+                gmGroupOffsetB += inGroupProblemShape.k() * inGroupProblemShape.n();
 
-                // Compute block-scoped matrix multiply-add
-                if constexpr (BlockMmad::DispatchPolicy::ASYNC) {
-                    blockMmad(gmA[gmGroupOffsetA + gmOffsetA], layoutA, gmB[gmGroupOffsetB + gmOffsetB], layoutB,
-                              gmC[gmOffsetC], layoutC, actualBlockShape, callbackBeforeFixpipe, callbackAfterFixpipe);
-                } else {
-                    callbackBeforeFixpipe();
-                    blockMmad(gmA[gmGroupOffsetA + gmOffsetA], layoutA, gmB[gmGroupOffsetB + gmOffsetB], layoutB,
-                              gmC[gmOffsetC], layoutC, actualBlockShape);
-                    callbackAfterFixpipe();
-                }
-
-                stageId = (stageId + 1 < WORKSPACE_STAGES) ? (stageId + 1) : 0;
+                startCoreIdx = (startCoreIdx + coreLoops) % aicNum;
             }
-
-            gmGroupOffsetA += inGroupProblemShape.m() * inGroupProblemShape.k();
-            gmGroupOffsetB += inGroupProblemShape.k() * inGroupProblemShape.n();
-
-            startCoreIdx = (startCoreIdx + coreLoops) % aicNum;
         }
 
         if constexpr (BlockMmad::DispatchPolicy::ASYNC) {
@@ -783,7 +795,7 @@ public:
     }
 
     ACT_DEVICE
-    void SendToShareExprt(GM_ADDR gmX, GM_ADDR gmX1, GM_ADDR gmX1Scale)
+    void SendToShareExpert(GM_ADDR gmX, GM_ADDR gmX1, GM_ADDR gmX1Scale)
     {
         // 给共享专家发送token
         uint32_t newAivId = sendCoreIdx - sendToMoeAivNum;
@@ -883,7 +895,7 @@ public:
     }
 
     ACT_DEVICE
-    void SendToMoeExprt(GM_ADDR gmX, GM_ADDR gmExpandIdx)
+    void SendToMoeExpert(GM_ADDR gmX, GM_ADDR gmExpandIdx)
     {
         // 给路由专家发送token
         uint32_t sendTokenNum = expertIdsCnt / sendToMoeAivNum;
@@ -931,15 +943,26 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(0);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(1);
         uint32_t sendValidTokenIndex = 0;
-        for (uint32_t sendGroupIndex = 0; sendGroupIndex < moeExpertNumPerRank; ++sendGroupIndex) {
+        uint32_t numExpertGroups = 4;  // 一共有四组专家
+
+        uint32_t recvExpertNum = isShareExpert ? epRankSize : expertCntUp;  // 总共的专家数 256
+        uint32_t expertPerRank = recvExpertNum / epRankSize;                // 256 / 16 = 8
+        // 卡上专家分为四组；每组有多少专家：8 / 4 = 2
+        uint32_t expertPerGroup = expertPerRank / numExpertGroups;
+
+        for (uint32_t groupIndex = 0; groupIndex < numExpertGroups; ++groupIndex) {  // 0..4
             for (uint32_t tokenIndex = startTokenId; tokenIndex < endTokenId; ++tokenIndex) {
-                int32_t dstExpertId = expertIdsTensor_(tokenIndex);
+                int32_t dstExpertId = expertIdsTensor_(tokenIndex);  // 0 start
                 if (dstExpertId < 0) {
                     continue;
                 }
-                if ((dstExpertId % moeExpertNumPerRank) != sendGroupIndex) {  // 优先发送指定专家的token
+                // 判断是否属于当前组的专家
+                AscendC::printf("dstExpertId = %ld, moeExpertNumPerRank = %ld, expertPerGroup =%d \n", dstExpertId,
+                                moeExpertNumPerRank, expertPerGroup);
+                if ((dstExpertId % moeExpertNumPerRank) / expertPerGroup != groupIndex) {
                     continue;
                 }
+
                 uint32_t index = (sendValidTokenIndex & 1) ? 0 : 1;
                 int32_t eventId = (sendValidTokenIndex & 1) ? 0 : 1;
                 sendValidTokenIndex += 1;
@@ -972,6 +995,49 @@ public:
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventId);
             }
         }
+
+        //        for (uint32_t sendGroupIndex = 0; sendGroupIndex < moeExpertNumPerRank; ++sendGroupIndex) {
+        //            for (uint32_t tokenIndex = startTokenId; tokenIndex < endTokenId; ++tokenIndex) {
+        //                int32_t dstExpertId = expertIdsTensor_(tokenIndex);
+        //                if (dstExpertId < 0) {
+        //                    continue;
+        //                }
+        //                if ((dstExpertId % moeExpertNumPerRank) != sendGroupIndex) {  // 优先发送指定专家的token
+        //                    continue;
+        //                }
+        //                uint32_t index = (sendValidTokenIndex & 1) ? 0 : 1;
+        //                int32_t eventId = (sendValidTokenIndex & 1) ? 0 : 1;
+        //                sendValidTokenIndex += 1;
+        //                int32_t curExpertCnt = 0;
+        //                CalExpandxIdx(dstExpertId, tokenIndex, curExpertCnt, ubOffset);
+        //                expertCountTensor(tokenIndex - startTokenId) = curExpertCnt;
+        //                uint32_t tempRankId = dstExpertId / moeExpertNumPerRank + sharedExpertRankNum;
+        //                GM_ADDR rankGM = (__gm__ uint8_t *)(GET_WIND_ADDR_BY_RANK_ID(tempRankId) +
+        //                                                    (expertPerSizeOnWin * (epRankId * moeExpertNumPerRank +
+        //                                                                           dstExpertId % moeExpertNumPerRank))
+        //                                                                           +
+        //                                                    hCommuSize * curExpertCnt);
+        //                dstWinGMTensor.SetGlobalBuffer((__gm__ int8_t *)rankGM);
+        //
+        //                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventId);
+        //                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
+        //                AscendC::DataCopy(xInTensor[index], srcWinGMTensor[tokenIndex / axisK * tokenLength],
+        //                tokenLength); AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventId);
+        //                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventId);
+        //                QuantToken(xInTensor[index], yInt8Tensor[index], ubOffset);
+        //                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventId);
+        //
+        //                AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+        //                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventId);
+        //
+        //                // 担心有时序问题，所以分开发送
+        //                AscendC::DataCopy(dstWinGMTensor, yInt8Tensor[index], tokenLength);
+        //                AscendC::PipeBarrier<PIPE_MTE3>();
+        //                AscendC::DataCopy(dstWinGMTensor[tokenLength], yInt8Tensor[index][tokenLength],
+        //                scaleParamPad); AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
+        //                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventId);
+        //            }
+        //        }
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);  // MTE2等MTE3
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(1);  // MTE2等MTE3
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(0);
@@ -1001,13 +1067,13 @@ SendCoreFunc(GM_ADDR gmX, GM_ADDR gmExpertIds, GM_ADDR gmX1, GM_ADDR gmX1Scale, 
     ubOffset += CEIL_UP(expertIdsCnt * sizeof(int32_t));
 
     AscendC::DataCopyExtParams expertIdsCntParams = {1U, static_cast<uint32_t>(expertIdsCnt * sizeof(uint32_t)), 0U, 0U,
-                                                     0U};
+                                                     0U};  // 发送表拷贝
     AscendC::DataCopyPadExtParams<int32_t> copyPadParams{false, 0U, 0U, 0U};
     AscendC::DataCopyPad(expertIdsTensor_, expertIdsGMTensor_, expertIdsCntParams, copyPadParams);
     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
 
-    CalAndSendTokenCount();
+    CalAndSendTokenCount();  // 计算count 每张卡给每个专家发多少token
     AscendC::PipeBarrier<PIPE_ALL>();
     if (hasShareExpert) {
         sendToShareAivNum = sendCoreNum / (axisK + 1);  // 均等分，取整
@@ -1019,9 +1085,9 @@ SendCoreFunc(GM_ADDR gmX, GM_ADDR gmExpertIds, GM_ADDR gmX1, GM_ADDR gmX1Scale, 
 
     AscendC::SetDeqScale((half)1.000000e+00f);
     if (hasShareExpert && sendCoreIdx >= sendToMoeAivNum) {
-        SendToShareExprt(gmX, gmX1, gmX1Scale);
+        SendToShareExpert(gmX, gmX1, gmX1Scale);
     } else {
-        SendToMoeExprt(gmX, gmExpandIdx);
+        SendToMoeExpert(gmX, gmExpandIdx);
     }
     AscendC::PipeBarrier<PIPE_ALL>();
 }
@@ -1123,8 +1189,8 @@ void GetCumSum(int32_t startRankId, int32_t recvExpertNum, int64_t ubOffset, GM_
 }
 
 ACT_DEVICE
-void RecvToken(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, uint32_t &coreTokenCount, uint32_t startRankId,
-               uint32_t endRankId, uint32_t recvRankNumPerCore, int64_t ubOffset)
+void RecvToken(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, uint32_t startRankId, uint32_t endRankId,
+               uint32_t recvRankNumPerCore, int64_t ubOffset)
 {
     // 接收token
     int64_t subUbOffset = ubOffset;
@@ -1149,6 +1215,16 @@ void RecvToken(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, uint32_t 
     AscendC::GlobalTensor<float> dynamicScalesOutGMTensor_;
     dynamicScalesOutGMTensor_.SetGlobalBuffer((__gm__ float *)(gmX1Scale));
     uint32_t beginIdx = 0;
+
+    uint32_t recvExpertNum = isShareExpert ? epRankSize : expertCntUp;  // 总共的专家数 256
+    AscendC::printf("recvExpertNum = %ld\n", recvExpertNum);
+
+    uint32_t numExpertGroups = 4;  // 4 组专家
+    // 每张卡上多少专家 单卡8专家
+    uint32_t expertPerRank = recvExpertNum / epRankSize;  // 256 / 16 = 8
+    // 卡上专家分为四组；每组有多少专家：8 / 4 = 2
+    uint32_t expertPerGroup = expertPerRank / numExpertGroups;
+
     for (uint32_t index = startRankId; index < endRankId; index++) {
         uint32_t i = index - startRankId;
         if (i > 0) {
@@ -1156,7 +1232,9 @@ void RecvToken(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, uint32_t 
                 i, gatherMaskOutCountTensor.GetValue(i - 1) + gatherMaskOutCountTensor.GetValue(index));
         }
         uint32_t count = statusTensor_.GetValue(index * INT32_COUNT_PER_BLOCK + 1);
-        coreTokenCount += count;
+        // find pos
+        uint32_t pos = (index / epRankSize) % expertPerGroup;  //%每组专家数
+        coreTokenCount[pos] += count;
         beginIdx = gatherMaskOutCountTensor.GetValue(i) - count;
         if (isShareExpert && index < sharedExpertRankNum) {
             beginIdx += count;
@@ -1176,8 +1254,10 @@ void RecvToken(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, uint32_t 
             tokGlobal.SetGlobalBuffer((__gm__ int8_t *)(wAddr + j * hCommuSize));
             tokGlobalInt32.SetGlobalBuffer((__gm__ int32_t *)(wAddr + j * hCommuSize + hOutSize));
             expandXOutGlobal.SetGlobalBuffer((__gm__ int8_t *)(gmX1) + (beginIdx + j) * tokenLength, tokenLength);
-
+            //            int loop = 1;
             while (true) {
+                //                loop++;
+                //                if (loop >= 1000000) break;
                 AscendC::DataCopy(tmpLocalTensor, tokGlobalInt32, INT32_COUNT_PER_BLOCK);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
@@ -1190,6 +1270,9 @@ void RecvToken(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, uint32_t 
                     break;
                 }
             }
+            //            AscendC::printf("loop = %ld\n", loop);
+            AscendC::printf("tmpLocalTensor.GetValue(1) = %ld\n", tmpLocalTensor.GetValue(1));
+            AscendC::printf("tokenFlag = %ld\n", tokenFlag);
             AscendC::PipeBarrier<PIPE_ALL>();
 
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
@@ -1201,6 +1284,7 @@ void RecvToken(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, uint32_t 
             AscendC::DataCopy(expandXOutGlobal, xTmpTensor_, tokenLength);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
         }
+
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
         beginIdx += count;
     }
@@ -1221,31 +1305,72 @@ void RecvCoreFunc(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, GM_ADD
     ubOffset = 0;
     RecvCount(ubOffset);
 
-    // 先按本地专家分核，再在专家内进一步分核
-    uint32_t recvExpertNum = isShareExpert ? epRankSize : expertCntUp;
-    uint32_t recvCoreNumPerGroup = recvCoreNum / localExpertNum;  // 每个group由若干核处理，这里先假定可以整除且不为0
-    uint32_t recvRankNumPerCore = epRankSize / recvCoreNumPerGroup;  // 每个核处理的rank数量
-    uint32_t remainderRankNum = epRankSize % recvCoreNumPerGroup;
+    uint32_t recvExpertNum = isShareExpert ? epRankSize : expertCntUp;  // 总共的专家数 256
+    //    AscendC::printf("recvExpertNum = %ld\n", recvExpertNum);
 
-    uint32_t groupId = recvCoreIdx / recvCoreNumPerGroup;                   // 当前核处理的是哪个group
-    uint32_t recvCoreIdxInGroup = recvCoreIdx % recvCoreNumPerGroup;        // 当前核处理的是group中第几个
+    uint32_t numExpertGroups = 4;  // 4 组专家
+    // 每张卡上多少专家 单卡8专家
+    uint32_t expertPerRank = recvExpertNum / epRankSize;  // 256 / 16 = 8
+    // 卡上专家分为四组；每组有多少专家：8 / 4 = 2
+    uint32_t expertPerGroup = expertPerRank / numExpertGroups;
+    // 每组分配的核数固定值 24 / 4 = 6
+    uint32_t recvCoreNumPerGroup = recvCoreNum / numExpertGroups;  // 每组分配的核数 24 / 4 = 6
+    // 总任务块数量 8 * 8
+    uint32_t totalTaskNum = expertPerRank * epRankSize;
+    // 64 / 4 = 16
+    uint32_t totalTaskNumPerGroup = totalTaskNum / numExpertGroups;
+    AscendC::printf("recvCoreIdx = %ld, recvCoreNumPerGroup = %ld, totalTaskNum = %ld, totalTaskNumPerGroup = %ld\n",
+                    recvCoreIdx, recvCoreNumPerGroup, totalTaskNum, totalTaskNumPerGroup);
+    // 当前核属于哪个组 [0,1,2,3]
+    uint32_t groupId = recvCoreIdx / recvCoreNumPerGroup;  // 当前核负责的专家组编号 0-24 / 6 = [0,3];
+    uint32_t recvCoreIdxInGroup = recvCoreIdx % recvCoreNumPerGroup;  // 当前核在组内的序号 0-24 % 6 ;
+
+    uint32_t recvRankNumPerCore =
+        totalTaskNumPerGroup /
+        recvCoreNumPerGroup;  // 每个核处理的rank数量 64 / 6 = 10 // why (epRankSize) / recvCoreNumPerGroup
+    uint32_t remainderRankNum = totalTaskNumPerGroup % recvCoreNumPerGroup;  // 剩余的rank数量 64 % 6 = 4
+    AscendC::printf("recvCoreIdx = %ld, groupId = %ld, recvCoreIdxInGroup = %ld,\n", recvCoreIdx, groupId,
+                    recvCoreIdxInGroup);
+    //    totalTaskNumPerGroup / recvCoreNumPerGroup
+    // 每组6个核 --> 3333322
     uint32_t startRankIdInGroup = recvRankNumPerCore * recvCoreIdxInGroup;  // 当前核处理的起始rank
     if (recvCoreIdxInGroup < remainderRankNum) {
-        recvRankNumPerCore += 1;
+        recvRankNumPerCore += 1;  // 当前核处理的rank数量+1
         startRankIdInGroup += recvCoreIdxInGroup;
     } else {
         startRankIdInGroup += remainderRankNum;
     }
     uint32_t endRankIdInGroup = startRankIdInGroup + recvRankNumPerCore;
-    uint32_t startRankId = epRankSize * groupId + startRankIdInGroup;
-    uint32_t endRankId = epRankSize * groupId + endRankIdInGroup;
 
-    uint32_t coreTokenCount = 0;
+    uint32_t startRankId = totalTaskNumPerGroup * groupId + startRankIdInGroup;
+    uint32_t endRankId = totalTaskNumPerGroup * groupId + endRankIdInGroup;
+    AscendC::printf("recvCoreIdx = %ld, startRankId = %ld, endRankId = %ld\n", recvCoreIdx, startRankId, endRankId);
+
+    //    // 先按本地专家分核，再在专家内进一步分核
+    //    uint32_t recvExpertNum = isShareExpert ? epRankSize : expertCntUp; // 32
+    //    uint32_t recvCoreNumPerGroup = recvCoreNum / localExpertNum;  //
+    //    每个group由若干核处理，这里先假定可以整除且不为0 32 / 4 = 8 uint32_t recvRankNumPerCore = epRankSize /
+    //    recvCoreNumPerGroup;  // 每个核处理的rank数量 uint32_t remainderRankNum = epRankSize % recvCoreNumPerGroup;
+    //
+    //    uint32_t groupId = recvCoreIdx / recvCoreNumPerGroup;                   // 当前核处理的是哪个group 当前核的id
+    //    / 每组处理的核数 uint32_t recvCoreIdxInGroup = recvCoreIdx % recvCoreNumPerGroup;        //
+    //    当前核处理的是group中第几个 uint32_t startRankIdInGroup = recvRankNumPerCore * recvCoreIdxInGroup;  //
+    //    当前核处理的起始rank if (recvCoreIdxInGroup < remainderRankNum) {
+    //        recvRankNumPerCore += 1;
+    //        startRankIdInGroup += recvCoreIdxInGroup;
+    //    } else {
+    //        startRankIdInGroup += remainderRankNum;
+    //    }
+    //    uint32_t endRankIdInGroup = startRankIdInGroup + recvRankNumPerCore;
+    //    uint32_t startRankId = epRankSize * groupId + startRankIdInGroup;
+    //    uint32_t endRankId = epRankSize * groupId + endRankIdInGroup;
+    //
+    //    uint32_t coreTokenCount = 0;
 
     if (startRankId < recvExpertNum) {
         // 计算前缀和，以及接收token。这里有隐含约束，下面两个函数与RecvCount的ubOffset入参应保持一致，这样才能拿到有效数据
         GetCumSum(startRankId, recvExpertNum, ubOffset, gmOutputRecvCount);
-        RecvToken(gmX1, gmX1Scale, gmEpSendCount, coreTokenCount, startRankId, endRankId, recvRankNumPerCore, ubOffset);
+        RecvToken(gmX1, gmX1Scale, gmEpSendCount, startRankId, endRankId, recvRankNumPerCore, ubOffset);
     }
 
     // 接收完成，通过写GM告知C核和计算V核
@@ -1254,15 +1379,19 @@ void RecvCoreFunc(GM_ADDR gmX1, GM_ADDR gmX1Scale, GM_ADDR gmEpSendCount, GM_ADD
     ubOffset += CEIL_UP(UB_BLOCK_SIZE);
     tmpLocalTensor.SetValue(CV_FLAG_INDEX, vToCFlag);
     tmpLocalTensor.SetValue(GROUP_ID_INDEX, groupId);
-    tmpLocalTensor.SetValue(SELF_COUNT_INDEX, coreTokenCount);
-    AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
+    AscendC::printf("expertPerGroup = %ld", expertPerGroup);
+    for (uint32_t i = 0; i < expertPerGroup; ++i) {  //
+        tmpLocalTensor.SetValue(SELF_COUNT_INDEX + i, coreTokenCount[i]);
+        AscendC::printf("i = %ld,coreTokenCount[i]= %ld", i, coreTokenCount[i]);
+    }
 
+    AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
     AscendC::GlobalTensor<int32_t> groupTokenNumStateTensor;
     groupTokenNumStateTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + GROUP_TOKEN_NUM_OFFSET));
     AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
     AscendC::SetAtomicAdd<int32_t>();
     // 用原子加，各个核收到的token数量加一起，就是专家收到的token数量
-    AscendC::DataCopy(groupTokenNumStateTensor[groupId * GROUP_INFO_SIZE], tmpLocalTensor, INT32_COUNT_PER_BLOCK);
+    AscendC::DataCopy(groupTokenNumStateTensor[groupId * GROUP_INFO_SIZE], tmpLocalTensor, 24);  // 24
     AscendC::SetAtomicNone();
     AscendC::PipeBarrier<PIPE_ALL>();
 }
@@ -1288,9 +1417,19 @@ void CompCoreFunc(GM_ADDR gmCVSwapBuff, __gm__ ElementScale *gmScale, __gm__ Ele
         uint32_t stageId = 0;
         uint32_t target = 1;
         uint32_t startCoreIdx = 0;
-
         AscendC::GlobalTensor<int32_t> groupTokenNumStateTensor;
-        for (uint32_t groupIdx = 0; groupIdx < localExpertNum; ++groupIdx) {
+
+        uint32_t recvExpertNum = isShareExpert ? epRankSize : expertCntUp;  // 总共的专家数 256
+        AscendC::printf("recvExpertNum = %ld\n", recvExpertNum);
+
+        uint32_t numExpertGroups = 4;  // 4 组专家
+        // 每张卡上多少专家 单卡8专家
+        uint32_t expertPerRank = recvExpertNum / epRankSize;  // 256 / 16 = 8
+        // 卡上专家分为四组；每组有多少专家：8 / 4 = 2
+        uint32_t expertPerGroup = expertPerRank / numExpertGroups;
+
+        uint32_t currentM;
+        for (uint32_t groupIdx = 0; groupIdx < 4; ++groupIdx) {
             // 流程与C核类似，等专家token数据，以及计算、软同步
             groupTokenNumStateTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + GROUP_TOKEN_NUM_OFFSET) +
                                                      groupIdx * GROUP_INFO_SIZE);
@@ -1299,49 +1438,54 @@ void CompCoreFunc(GM_ADDR gmCVSwapBuff, __gm__ ElementScale *gmScale, __gm__ Ele
                 AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                                   AscendC::DcciDst::CACHELINE_OUT>(groupTokenNumStateTensor);
                 __asm__ __volatile__("");
-                if (groupTokenNumStateTensor.GetValue(0) == coreNumPerGroup * vToCFlag) {
+                if (groupTokenNumStateTensor.GetValue(0) == 6 * vToCFlag) {
                     break;
                 }
             }
-            uint32_t currentM = groupTokenNumStateTensor.GetValue(GROUP_TOKEN_COUNT);
-            GemmCoord inGroupProblemShape{currentM, n, k};
-            LayoutPerTokenScale layoutPerTokenScale =
-                wholeLayoutPerTokenScale.GetTileLayout(inGroupProblemShape.template GetCoordByAxis<0>());
-            LayoutD layoutD = layoutOutput.GetTileLayout(MakeCoord(currentM, nOut));
-            EpilogueParams epilogueParams{gmScale + gmGroupOffsetScale,
-                                          layoutScale,
-                                          gmTokenScale + gmGroupOffsetPerTokenScale,
-                                          layoutPerTokenScale,
-                                          gmSwigluOutput + gmGroupOffsetD,
-                                          layoutD};
-            blockScheduler.Update(inGroupProblemShape, L1TileShape::ToCoordMN());
-            blockEpilogue.UpdateParams(epilogueParams);
-            uint32_t coreLoops = blockScheduler.GetCoreLoops();
 
-            GemmCoord blockShapeMNK = L1TileShape::ToCoord();
-            uint32_t startLoopIdx =
-                ((compCoreIdx < startCoreIdx) ? (compCoreIdx + aiCoreGroupNum) : compCoreIdx) - startCoreIdx;
-            for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += aiCoreGroupNum) {
-                GemmCoord blockCoordMNK = blockScheduler.GetBlockCoord(loopIdx);
-                GemmCoord actualBlockShapeMNK = blockScheduler.GetActualBlockShape(blockCoordMNK);
+            for (uint32_t expertIdInGroup = 0; expertIdInGroup < expertPerGroup; ++expertIdInGroup) {
+                uint32_t currentM = groupTokenNumStateTensor.GetValue(GROUP_TOKEN_COUNT + expertIdInGroup);
+                AscendC::printf("groupIdx = %ld, expertIdInGroup = %ld, currentM =%d \n", groupIdx, expertIdInGroup,
+                                currentM);
+                GemmCoord inGroupProblemShape{currentM, n, k};
+                LayoutPerTokenScale layoutPerTokenScale =
+                    wholeLayoutPerTokenScale.GetTileLayout(inGroupProblemShape.template GetCoordByAxis<0>());
+                LayoutD layoutD = layoutOutput.GetTileLayout(MakeCoord(currentM, nOut));
+                EpilogueParams epilogueParams{gmScale + gmGroupOffsetScale,
+                                              layoutScale,
+                                              gmTokenScale + gmGroupOffsetPerTokenScale,
+                                              layoutPerTokenScale,
+                                              gmSwigluOutput + gmGroupOffsetD,
+                                              layoutD};
+                blockScheduler.Update(inGroupProblemShape, L1TileShape::ToCoordMN());
+                blockEpilogue.UpdateParams(epilogueParams);
+                uint32_t coreLoops = blockScheduler.GetCoreLoops();
 
-                MatrixCoord offsetC{(stageId * aiCoreGroupNum + aiCoreGroupIdx) * L1TileShape::M, 0};
-                int64_t gmOffsetC = layoutC.GetOffset(offsetC);
-                auto gmBlockC = gmC[gmOffsetC];
-                auto layoutBlockC = layoutC.GetTileLayout(actualBlockShapeMNK.GetCoordMN());
-                CheckSyncFlag(statusDataSpaceGm + SOFT_SYNC_OFFSET, static_cast<uint8_t>(compCoreNum + compCoreIdx),
-                              target);  // AIV等待的信号在后一半
-                target += 1;
-                blockEpilogue(blockShapeMNK, blockCoordMNK, actualBlockShapeMNK, gmBlockC, layoutBlockC);
-                EncreaseSyncFlag(statusDataSpaceGm + SOFT_SYNC_OFFSET, static_cast<uint8_t>(compCoreIdx));
-                stageId = (stageId + 1 < WORKSPACE_STAGES) ? (stageId + 1) : 0;
+                GemmCoord blockShapeMNK = L1TileShape::ToCoord();
+                uint32_t startLoopIdx =
+                    ((compCoreIdx < startCoreIdx) ? (compCoreIdx + aiCoreGroupNum) : compCoreIdx) - startCoreIdx;
+                for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += aiCoreGroupNum) {
+                    GemmCoord blockCoordMNK = blockScheduler.GetBlockCoord(loopIdx);
+                    GemmCoord actualBlockShapeMNK = blockScheduler.GetActualBlockShape(blockCoordMNK);
+
+                    MatrixCoord offsetC{(stageId * aiCoreGroupNum + aiCoreGroupIdx) * L1TileShape::M, 0};
+                    int64_t gmOffsetC = layoutC.GetOffset(offsetC);
+                    auto gmBlockC = gmC[gmOffsetC];
+                    auto layoutBlockC = layoutC.GetTileLayout(actualBlockShapeMNK.GetCoordMN());
+                    CheckSyncFlag(statusDataSpaceGm + SOFT_SYNC_OFFSET, static_cast<uint8_t>(compCoreNum + compCoreIdx),
+                                  target);  // AIV等待的信号在后一半
+                    target += 1;
+                    blockEpilogue(blockShapeMNK, blockCoordMNK, actualBlockShapeMNK, gmBlockC, layoutBlockC);
+                    EncreaseSyncFlag(statusDataSpaceGm + SOFT_SYNC_OFFSET, static_cast<uint8_t>(compCoreIdx));
+                    stageId = (stageId + 1 < WORKSPACE_STAGES) ? (stageId + 1) : 0;
+                }
+
+                gmGroupOffsetScale += inGroupProblemShape.n();
+                gmGroupOffsetPerTokenScale += inGroupProblemShape.m();
+                gmGroupOffsetD += currentM * nOut;
+
+                startCoreIdx = (startCoreIdx + coreLoops) % aiCoreGroupNum;
             }
-
-            gmGroupOffsetScale += inGroupProblemShape.n();
-            gmGroupOffsetPerTokenScale += inGroupProblemShape.m();
-            gmGroupOffsetD += currentM * nOut;
-
-            startCoreIdx = (startCoreIdx + coreLoops) % aiCoreGroupNum;
         }
     }
     // 清理软同步残留信息，避免影响别处或者下次运行
@@ -1530,7 +1674,8 @@ ACT_DEVICE void operator()<AscendC::AIV>(Params const &params)
         RecvCoreFunc((GM_ADDR)params.ptrA, (GM_ADDR)params.ptrPerTokenScale, (GM_ADDR)params.gmEpSendCount,
                      (GM_ADDR)params.gmOutputRecvCount);
     }
-
+    AscendC::printf("finish isRecvCore \n");
+    //    return; // TDS
     auto gmSwigluOutput = reinterpret_cast<__gm__ float *>(
         params.ptrWorkspace + sizeof(int32_t) * (L1TileShape::M * aiCoreGroupNum * WORKSPACE_STAGES * L1TileShape::N));
     if (isCompCore) {
@@ -1538,7 +1683,7 @@ ACT_DEVICE void operator()<AscendC::AIV>(Params const &params)
                      params.problemShape.n(), params.problemShape.k(), params.layoutScale, params.layoutPerTokenScale,
                      params.layoutOutput);
     }
-
+    AscendC::printf("finish isCompCore \n");
     icache_preload(8);
     AscendC::SyncAll<false>();
     AscendC::PipeBarrier<PIPE_ALL>();
@@ -1622,7 +1767,7 @@ uint32_t localExpertNum{0};
 uint32_t sharedExpertRankNum{0};
 uint32_t moeExpertNumPerRank{0};
 uint32_t moeExpertNum{0};
-
+uint32_t coreTokenCount[16] = {0};
 // token相关
 uint32_t hOutSize{0};
 uint32_t scaleParamPad{0};

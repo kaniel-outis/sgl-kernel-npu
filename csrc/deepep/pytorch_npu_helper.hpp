@@ -244,6 +244,8 @@ inline aclTensor *ConvertType(const at::Tensor &at_tensor)
 
     if (acl_data_type == ACL_INT8 && dimNum == 3) {
         format = ACL_FORMAT_FRACTAL_NZ;
+    } else {
+        AT_ERROR("acl_data_type = ");
     }
 
     if (at_tensor.unsafeGetTensorImpl()->is_wrapped_number()) {
