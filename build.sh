@@ -94,6 +94,14 @@ fi
 
 echo "Use SOC_VERSION: $SOC_VERSION"
 
+## ====================== A5 特殊处理：跳过所有 FFN 相关文件 ======================
+#if [[ "$SOC_VERSION" == "ascend950pr_950z" || "$SOC_VERSION" == "Ascend910B4" ]]; then
+#    export SKIP_FFN="ON"
+#    echo "=== A5 (Ascend950) mode enabled: All FFN-related files will be SKIPPED ==="
+#else
+#    export SKIP_FFN="OFF"
+#fi
+
 ## ====================== 【关键修复：CANN 8.3 ASCConfig.cmake】 ======================
 echo "=== Fixing ASCConfig for CANN 8.3 / A2 ==="
 
@@ -155,7 +163,7 @@ function build_kernels()
     -DASCEND_INCLUDE_DIR=$ASCEND_INCLUDE_DIR \
     -DCMAKE_PREFIX_PATH="$ASC_CMAKE_DIR" \
     -DASC_DIR="$ASC_CMAKE_DIR" \
-    -DSOC_VERSION=$SOC_VERSION \
+    -DSOC_VERSION=Ascend910_9382 \
     -DBUILD_DEEPEP_MODULE=$BUILD_DEEPEP_MODULE \
     -DBUILD_KERNELS_MODULE=$BUILD_KERNELS_MODULE \
     -B "$BUILD_DIR" \
