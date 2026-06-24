@@ -27,11 +27,6 @@ struct Buffer {
     bool combine_enable_long_seq = false;  // Whether to enable the Combine Ant Migration feature
 
     bool low_latency_mode = false;
-    bool is_padding = false;
-    int padding_cnt = 0;
-    at::Tensor ori_x;
-    at::Tensor new_topk_idx;
-    at::Tensor new_scales;
     at::Tensor notify_send_data;  // only for internode notify
     at::Tensor send_token_idx_small;
     int notify_send_data_size;  // only for internode notify
@@ -77,7 +72,7 @@ public:
                        const std::optional<at::Tensor> &cached_channel_prefix_matrix,
                        const std::optional<at::Tensor> &dispatch_wait_recv_cost_stats, int expert_alignment,
                        int num_worst_tokens, const Config &config, std::optional<EventHandle> &previous_event,
-                       bool async, bool allocate_on_comm_stream, bool use_quant);
+                       bool async, bool allocate_on_comm_stream, bool use_quant, const std::string &quant_type);
 
     std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                at::Tensor>
@@ -133,5 +128,11 @@ public:
                                            const at::Tensor &gmm2WeightScale, const at::Tensor &expertScalesOptional,
                                            int64_t num_max_dispatch_tokens_per_rank, int64_t num_experts,
                                            int quant_mode);
+
+    std::vector<at::Tensor> dispatch_ffn_combine(const at::Tensor &x, const at::Tensor &expert_ids,
+                                                 const at::Tensor &weight1, const at::Tensor &scale1,
+                                                 const at::Tensor &weight2, const at::Tensor &scale2,
+                                                 const at::Tensor &expert_scales, int64_t max_output_size,
+                                                 int64_t num_experts, int quant_mode) const;
 };
 }  // namespace deep_ep

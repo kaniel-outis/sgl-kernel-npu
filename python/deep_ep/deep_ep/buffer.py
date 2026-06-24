@@ -1,4 +1,5 @@
 import os
+from enum import IntEnum
 from typing import Callable, List, Optional, Tuple, Union
 
 import deep_ep_cpp
@@ -7,7 +8,19 @@ import torch.distributed as dist
 import torch_npu
 from deep_ep_cpp import Config, EventHandle
 
+from .ep_strategy import (
+    LowLatencyStrategy,
+    NormalStrategy,
+    StrategyMap,
+    get_low_latency_strategy,
+    get_normal_strategy,
+)
 from .utils import EventOverlap, log_parameters
+
+
+class FuseMode(IntEnum):
+    FUSED_DEEP_MOE = 1
+    DISPATCH_FFN_COMBINE = 2
 
 
 class Buffer:
@@ -23,6 +36,10 @@ class Buffer:
         num_qps_per_rank: int = 12,
         allow_nvlink_for_low_latency_mode: bool = True,
         allow_mnnvl: bool = False,
+        normal_strategy: Union[str, NormalStrategy] = NormalStrategy.DEFAULT,
+        low_latency_strategy: Union[
+            str, LowLatencyStrategy
+        ] = LowLatencyStrategy.DEFAULT,
     ) -> None:
         """
         Initialize the communication buffer.
@@ -37,8 +54,11 @@ class Buffer:
                 to the number of local experts.
             allow_nvlink_for_low_latency_mode: This parameter is deprecated and retained to ensure compatibility with DeepEP.
             allow_mnnvl: This parameter is deprecated and retained to ensure compatibility with DeepEP.
+            normal_strategy: the strategy to use for normal mode dispatch/combine, support: default, alltoall.
+            low_latency_strategy: the strategy to use for low latency mode dispatch/combine, support: default, ops.
         """
 
+        self.group = group
         self.rank = group.rank()
         self.group_size = group.size()
         self.num_nvl_bytes = num_nvl_bytes
@@ -50,6 +70,9 @@ class Buffer:
         except Exception as e:
             print("get_hccl_comm_name failed", e)
             moe_all_to_all_group_name = ""
+
+        self.moe_all_to_all_group_name = moe_all_to_all_group_name
+
         self.runtime = deep_ep_cpp.Buffer(
             self.rank,
             self.group_size,
@@ -58,6 +81,46 @@ class Buffer:
             low_latency_mode,
             moe_all_to_all_group_name,
         )
+
+        # set strategy by env
+        deep_mode = os.getenv("DEEP_USE_MODE", "default").lower()
+
+        normal_strategy, low_latency_strategy = StrategyMap.get_strategy(deep_mode)
+
+        # Initialize normal mode strategy
+        self._init_normal_strategy(normal_strategy)
+
+        # Initialize low latency mode strategy
+        self._init_low_latency_strategy(low_latency_strategy)
+
+    def _init_normal_strategy(self, strategy: Union[str, NormalStrategy]):
+        """Initialize normal mode communication strategy"""
+        if isinstance(strategy, NormalStrategy):
+            strategy = strategy.value
+        strategy_cls = get_normal_strategy(strategy)
+
+        self.normal_strategy = strategy_cls(
+            runtime=self.runtime,
+            group=self.group,
+        )
+
+    def _init_low_latency_strategy(
+        self, strategy: Union[str, NormalStrategy], comm_alg: str = "hierarchy"
+    ):
+        """Initialize low latency mode communication strategy"""
+        if isinstance(strategy, LowLatencyStrategy):
+            strategy = strategy.value
+        strategy_cls = get_low_latency_strategy(strategy)
+
+        # Pass different init kwargs based on strategy type
+        init_kwargs = {
+            "runtime": self.runtime,
+            "group": self.group,
+        }
+        if strategy == "ops":
+            init_kwargs["comm_alg"] = comm_alg
+
+        self.low_latency_strategy = strategy_cls(**init_kwargs)
 
     @staticmethod
     def get_dispatch_config(num_ranks: int) -> Config:
@@ -178,25 +241,13 @@ class Buffer:
             is_token_in_rank: `[num_tokens, num_ranks]` with `torch.int`, whether a token be sent to a rank.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
-        (
-            num_tokens_per_rank,
-            num_tokens_per_rdma_rank,
-            num_tokens_per_expert,
-            is_token_in_rank,
-            event,
-        ) = self.runtime.get_dispatch_layout(
-            topk_idx,
-            num_experts,
-            getattr(previous_event, "event", None),
-            async_finish,
-            allocate_on_comm_stream,
-        )
-        return (
-            num_tokens_per_rank,
-            num_tokens_per_rdma_rank,
-            num_tokens_per_expert,
-            is_token_in_rank,
-            EventOverlap(event),
+        # Delegate to normal strategy
+        return self.normal_strategy.get_dispatch_layout(
+            topk_idx=topk_idx,
+            num_experts=num_experts,
+            previous_event=previous_event,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
         )
 
     # internal interface, Only use in test
@@ -214,10 +265,10 @@ class Buffer:
         self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int
     ) -> None:
         """
-        As low-latency kernels require part of the buffer to be zero-initialized, so it is vital to clean the buffer
-            if the buffer is dirty at some time.
-        For example, after running the normal dispatch/combine, you must run this function before executing any
-            low-latency kernel.
+        Compatibility hook for cleaning low-latency buffers.
+
+        The current backend implementation is a no-op and does not clear any device/RDMA buffer. This method is kept for
+        API compatibility with DeepEP callers that invoke it when switching from normal mode to low-latency mode.
 
         Arguments:
             num_max_dispatch_tokens_per_rank: the maximum number of tokens to dispatch, all the ranks must hold the same value.
@@ -262,10 +313,13 @@ class Buffer:
             index should be visible via RDMA.
 
         Arguments:
-            x: `torch.Tensor` or tuple of `torch.Tensor`, for the first type, the shape must be `[num_tokens, hidden]`,
-                and type must be `torch.bfloat16`; for the second type, the first element of the tuple must be shaped as
-                `[num_tokens, hidden]` with type `torch.float8_e4m3fn`, the second must be `[num_tokens, hidden // 128]`
-                 (requiring divisible) with type `torch.float`.
+            x: input tokens. Supports two formats:
+                - `torch.Tensor` with `torch.bfloat16`, shaped `[num_tokens, hidden]`. Quantization is controlled by
+                  the `DEEP_NORMAL_MODE_USE_INT8_QUANT` environment variable (set to `1` for INT8 quantization, **deprecated**).
+                - Tuple of two `torch.Tensor`: for MXFP8 quantization, the first element is shaped `[num_tokens, hidden]`
+                  with `torch.float8_e4m3fn` (pre-quantized data), the second is shaped `[num_tokens, hidden // 32]`
+                  with `torch.float8_e8m0fnu` (per-block E8M0 scales). On NPU, this triggers MXFP8 per-block quantization
+                  (quant_mode=3) inside the dispatch kernel.
             handle: an optional communication handle, if set, the CPU will reuse the layout information to save some time.
             num_tokens_per_rank: `[num_ranks]` with `torch.int`, the number of tokens to be sent to each rank.
             num_tokens_per_rdma_rank: `[num_rdma_ranks]` with `torch.int`, the number of tokens to be sent to each RDMA
@@ -286,9 +340,13 @@ class Buffer:
                 to receive all tokens from each slave rank in the current rank.
 
         Returns:
-            recv_x: received tokens, the first element is a `torch.Tensor` shaped as `[received_token_count, hidden]` with
-                `torch.int8`, the second tensor is the corresponding scales for the first element with shape `[received_token_count]`
-                with `torch.float`.
+            recv_x: received tokens. The format depends on quantization mode:
+                - BF16 (no quantization): a `torch.Tensor` shaped `[received_token_count, hidden]` with `torch.bfloat16`.
+                - INT8 (`DEEP_NORMAL_MODE_USE_INT8_QUANT=1`, **deprecated**): a tuple, first element shaped `[received_token_count, hidden]`
+                  with `torch.int8`, second element shaped `[received_token_count]` with `torch.float32` (per-token scales).
+                - MXFP8 (tuple input with `float8_e4m3fn` + `float8_e8m0fnu`, A5/C310 only): a tuple, first element shaped
+                  `[received_token_count, hidden]` with `torch.float8_e4m3fn`, second element shaped
+                  `[received_token_count, hidden // 32]` with `torch.float8_e8m0fnu` (per-block E8M0 scales).
             recv_topk_idx: received expert indices.
             recv_topk_weights: received expert weights.
             num_recv_tokens_per_expert_list: Python list shaped `[num_local_experts]`, the received token count by
@@ -300,92 +358,24 @@ class Buffer:
         # Default config
         config = self.get_dispatch_config(self.group_size) if config is None else config
 
-        # Internode
-        if self.runtime.get_num_rdma_ranks() > 1:
-            return self.internode_dispatch(
-                x,
-                handle,
-                num_tokens_per_rank,
-                num_tokens_per_rdma_rank,
-                is_token_in_rank,
-                num_tokens_per_expert,
-                topk_idx,
-                topk_weights,
-                expert_alignment,
-                config,
-                previous_event,
-                async_finish,
-                allocate_on_comm_stream,
-            )
-
-        # Launch the kernel with cached or non-cached mode
-        if isinstance(x, tuple):
-            raise NotImplementedError("Not support fp8")
-        x_scales = None
-        use_quant = os.getenv("DEEP_NORMAL_MODE_USE_INT8_QUANT") == "1"
-
-        if handle is not None:
-            raise NotImplementedError(
-                "Optional communication handle is not supported yet."
-            )
-        else:
-            assert (
-                num_tokens_per_rank is not None
-                and is_token_in_rank is not None
-                and num_tokens_per_expert is not None
-            )
-            (
-                recv_x,
-                recv_x_scales,
-                recv_topk_idx,
-                recv_topk_weights,
-                num_recv_tokens_per_expert_list,
-                rank_prefix_matrix,
-                channel_prefix_matrix,
-                recv_channel_prefix_matrix,
-                recv_src_idx,
-                send_head,
-                event,
-            ) = self.runtime.intranode_dispatch(
-                x,
-                x_scales,
-                topk_idx,
-                topk_weights,
-                num_tokens_per_rank,
-                is_token_in_rank,
-                num_tokens_per_expert,
-                0,
-                None,
-                None,
-                dispatch_wait_recv_cost_stats,
-                expert_alignment,
-                num_worst_tokens,
-                config,
-                getattr(previous_event, "event", None),
-                async_finish,
-                allocate_on_comm_stream,
-                use_quant,
-            )
-            handle = (
-                rank_prefix_matrix,
-                channel_prefix_matrix,
-                recv_channel_prefix_matrix,
-                recv_src_idx,
-                is_token_in_rank,
-                send_head,
-                topk_idx,
-                topk_weights,
-            )
-            return (
-                (recv_x, recv_x_scales) if use_quant else recv_x,
-                recv_topk_idx,
-                recv_topk_weights,
-                num_recv_tokens_per_expert_list,
-                handle,
-                EventOverlap(event),
-            )
-
-        # noinspection PyTypeChecker
+        # Delegate to normal strategy
+        return self.normal_strategy.dispatch(
+            x=x,
+            handle=handle,
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            expert_alignment=expert_alignment,
+            num_worst_tokens=num_worst_tokens,
+            config=config,
+            previous_event=previous_event,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+            dispatch_wait_recv_cost_stats=dispatch_wait_recv_cost_stats,
+        )
 
     @log_parameters(["topk_idx"])
     def notify_verify(
@@ -512,36 +502,21 @@ class Buffer:
             recv_topk_weights: the reduced top-k weights from its dispatch ranks.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
-        # Internode
-        if self.runtime.get_num_rdma_ranks() > 1:
-            return self.internode_combine(
-                x,
-                handle,
-                topk_weights,
-                bias,
-                config,
-                previous_event,
-                async_finish,
-                allocate_on_comm_stream,
-            )
+        # Default config
+        config = self.get_combine_config(self.group_size) if config is None else config
 
-        # NOTES: the second `_` is for the sending side, so we should use the third one
-        (
-            rank_prefix_matrix,
-            _,
-            channel_prefix_matrix,
-            src_idx,
-            is_recv_token_in_rank,
-            send_head,
-            topk_idx,
-            topk_weights_ori,
-        ) = handle
-
-        # Launch the kernel
-        recv_x, recv_topk_weights, event = self.runtime.intranode_combine(
-            x, topk_idx, topk_weights_ori, src_idx, send_head, combine_send_cost_stats
+        # Delegate to normal strategy
+        return self.normal_strategy.combine(
+            x=x,
+            handle=handle,
+            topk_weights=topk_weights,
+            bias=bias,
+            config=config,
+            previous_event=previous_event,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+            combine_send_cost_stats=combine_send_cost_stats,
         )
-        return recv_x, recv_topk_weights, EventOverlap(event)
 
     def internode_dispatch(
         self,
@@ -685,6 +660,7 @@ class Buffer:
         use_ue8m0: bool = False,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        topk_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[
         Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable
     ]:
@@ -701,78 +677,48 @@ class Buffer:
             cumulative_local_expert_recv_stats: a cumulative expert count tensor for statistics, which should have shape
                 `[num_local_experts]` and be typed as `torch.int`. This is useful for online service EP load balance
                 monitoring.
-            use_fp8: whether to enable FP8 casting, with this, the received data will be a tuple of FP8 tensor and scaling factors.
-            round_scale: whether round the scaling factors into power of 2.
-            use_ue8m0: whether use UE8M0 as scaling factor format (available only with `round_scale=True`).
+            use_fp8: whether to enable FP8 quantization. On NPU, this enables per-token dynamic quantization (quant_mode=2)
+                by default, with INT8 as the compact data format and per-token float32 scales.
+            round_scale: whether to round the scaling factors into power of 2.
+            use_ue8m0: whether to use E8M0 (UE8M0) as the scaling factor format. On NPU, this triggers MXFP8 per-block
+                quantization (quant_mode=3) with `float8_e4m3fn` data and `float8_e8m0fnu` (per 32-element block) scales.
+                Requires `use_fp8=True`.
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             return_recv_hook: return a receiving hook if set. If set, the kernel will just do the RDMA request issues,
                 but **without actually receiving the data**. You must call the received hook to make sure the data's arrival.
                 If you do not set this flag, the kernel will ensure the data's arrival.
 
         Returns:
-            recv_x: a tensor or tuple with received tokens for each expert.
-                With `use_fp8=True`: the first element is a `torch.Tensor` shaped as
-                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden]` with `torch.float8_e4m3fn`.
-                The second tensor is the corresponding scales for the first element with shape
-                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden // 128]` with `torch.float`,
-                if `use_ue8m0=False`. With `use_ue8m0=True`, the second one is packed and shaped as
-                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden // 512]` with type `torch.int`.
-                Notice that, the last-two-dimension of the scaling tensors are in column-major for TMA compatibility.
-                With `use_fp8=False`, the result would be a tensor shaped as
-                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden]` with `torch.bfloat16`.
-                Moreover, not all tokens are valid, only some of the `num_max_dispatch_tokens_per_rank * num_ranks` are,
-                as we do not synchronize CPU received count with GPU (also not incompatible with CUDA graph if synced).
-            recv_count: a tensor shaped `[num_local_experts]` with type `torch.int`, indicating how many tokens each
-                expert receives. As mentioned before, not all tokens are valid in `recv_x`.
+            recv_x: received tokens. The format depends on quantization mode:
+                - BF16 (`use_fp8=False`): a `torch.Tensor` shaped `[num_max_tokens, hidden]` with `torch.bfloat16`.
+                - FP8 per-token (`use_fp8=True, use_ue8m0=False`): a tuple of two tensors. The first is shaped
+                  `[num_max_tokens, hidden]` with `torch.int8` (quantized data), the second is shaped `[num_max_tokens]`
+                  with `torch.float32` (per-token scales).
+                - MXFP8 per-block (`use_fp8=True, use_ue8m0=True`): a tuple of two tensors. The first is shaped
+                  `[num_max_tokens, hidden]` with `torch.float8_e4m3fn`, the second is shaped
+                  `[num_max_tokens * hidden / 32]` with `torch.float8_e8m0fnu` (per-block scales, one scale per
+                  32-element block).
+                Not all tokens are valid; only the first `recv_count` tokens per expert contain meaningful data.
+            recv_count: a tensor shaped `[num_local_experts]` with type `torch.int64`, indicating how many tokens each
+                expert receives.
             handle: the communication handle to be used in the `low_latency_combine` function.
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
-        topk_ids = topk_idx.int()
-        (
-            packed_recv_x,
-            packed_recv_x_scales,
-            packed_recv_count,
-            packed_recv_src_info,
-            packed_recv_layout_range,
-            event,
-            hook,
-        ) = self.runtime.low_latency_dispatch(
-            x,
-            topk_ids,
-            cumulative_local_expert_recv_stats,
-            num_max_dispatch_tokens_per_rank,
-            num_experts,
-            use_fp8,
-            round_scale,
-            use_ue8m0,
-            async_finish,
-            return_recv_hook,
-        )
-        handle = (
-            packed_recv_src_info,
-            packed_recv_layout_range,
-            num_max_dispatch_tokens_per_rank,
-            x.size(1),
-            num_experts,
-            packed_recv_count,
-        )
-        tensors_to_record = (
-            x,
-            topk_idx,
-            packed_recv_x,
-            packed_recv_x_scales,
-            packed_recv_count,
-            packed_recv_src_info,
-            packed_recv_layout_range,
-            cumulative_local_expert_recv_stats,
-        )
-        return (
-            (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x,
-            packed_recv_count,
-            handle,
-            EventOverlap(event, tensors_to_record if async_finish else None),
-            hook,
+        # Delegate to low latency strategy
+        # use_fp8 = True, use_ue8m0 = True = mxfp8
+        return self.low_latency_strategy.low_latency_dispatch(
+            x=x,
+            topk_idx=topk_idx,
+            num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+            num_experts=num_experts,
+            cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+            use_fp8=use_fp8,
+            round_scale=round_scale,
+            use_ue8m0=use_ue8m0,
+            async_finish=async_finish,
+            return_recv_hook=return_recv_hook,
+            topk_weights=topk_weights,
         )
 
     @log_parameters(["topk_idx"])
@@ -812,41 +758,16 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
-        topk_ids = topk_idx.int()
-        (
-            src_info,
-            layout_range,
-            num_max_dispatch_tokens_per_rank,
-            hidden,
-            num_experts,
-            packed_recv_count,
-        ) = handle
-        combined_x, event, hook = self.runtime.low_latency_combine(
-            x,
-            topk_ids,
-            topk_weights,
-            src_info,
-            layout_range,
-            num_max_dispatch_tokens_per_rank,
-            num_experts,
-            packed_recv_count,
-            zero_copy,
-            async_finish,
-            return_recv_hook,
-            out,
-        )
-        tensors_to_record = (
-            x,
-            topk_idx,
-            topk_weights,
-            src_info,
-            layout_range,
-            combined_x,
-        )
-        return (
-            combined_x,
-            EventOverlap(event, tensors_to_record if async_finish else None),
-            hook,
+        # Delegate to low latency strategy
+        return self.low_latency_strategy.low_latency_combine(
+            x=x,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            handle=handle,
+            zero_copy=zero_copy,
+            async_finish=async_finish,
+            return_recv_hook=return_recv_hook,
+            out=out,
         )
 
     def fused_deep_moe(
@@ -861,6 +782,7 @@ class Buffer:
         num_max_dispatch_tokens_per_rank: int,
         num_experts: int,
         quant_mode: int = 1,
+        fuse_mode: FuseMode = FuseMode.FUSED_DEEP_MOE,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         A fused low-latency implementation for MoE expert forward and combination.
@@ -880,9 +802,11 @@ class Buffer:
             gmm2_weight: weight tensor for the second stage (e.g., projection or FFN output).
             gmm2_weight_scale: quantization scale tensor corresponding to `gmm2Weight`.
 
-            num_max_dispatch_tokens_per_rank: the maximum number of tokens to dispatch, all the ranks must hold the same value.
+            num_max_dispatch_tokens_per_rank: the maximum number of tokens to dispatch, when fuse_mode is DISPATCH_FFN_COMBINE,
+                it indicates the maximum number of tokens received in dispatch. All the ranks must hold the same value.
             num_experts: the number of experts.
             quant_mode: int type, optional number, displays the quantization model. Supported values: 1 means int8 (default)
+            fuse_mode: Fuse mode enum (default: FuseMode.FUSED_DEEP_MOE).
 
         Notes:
             - The first dimension of `topk_idx` defines the batch size `bs`.
@@ -896,21 +820,39 @@ class Buffer:
             ep_recv_count: `torch.Tensor`, a 1D tensor of type `torch.int32`
                 indicating the number of tokens received by each expert across all ranks.
         """
-        gmm1_permuted_weight_scale = gmm1_permuted_weight_scale.float()
-        gmm2_weight_scale = gmm2_weight_scale.float()
         topk_ids = topk_idx.int()
+        if fuse_mode == FuseMode.FUSED_DEEP_MOE:
+            gmm1_permuted_weight_scale = gmm1_permuted_weight_scale.float()
+            gmm2_weight_scale = gmm2_weight_scale.float()
 
-        output, ep_recv_count = self.runtime.fused_deep_moe(
-            x,
-            topk_ids,
-            gmm1_permuted_weight,
-            gmm1_permuted_weight_scale,
-            gmm2_weight,
-            gmm2_weight_scale,
-            topk_weights,
-            num_max_dispatch_tokens_per_rank,
-            num_experts,
-            quant_mode,
-        )
-
-        return output, ep_recv_count
+            output, ep_recv_count = self.runtime.fused_deep_moe(
+                x,
+                topk_ids,
+                gmm1_permuted_weight,
+                gmm1_permuted_weight_scale,
+                gmm2_weight,
+                gmm2_weight_scale,
+                topk_weights,
+                num_max_dispatch_tokens_per_rank,
+                num_experts,
+                quant_mode,
+            )
+            return output, ep_recv_count
+        elif fuse_mode == FuseMode.DISPATCH_FFN_COMBINE:
+            # The maximum number of tokens that rank can obtain during dispatch. (max_bs * ranks * topk)
+            max_output_size = num_max_dispatch_tokens_per_rank
+            output, expert_token_nums = self.runtime.dispatch_ffn_combine(
+                x,
+                topk_ids,
+                gmm1_permuted_weight,
+                gmm1_permuted_weight_scale,
+                gmm2_weight,
+                gmm2_weight_scale,
+                topk_weights,
+                max_output_size,
+                num_experts,
+                quant_mode,
+            )
+            return output, expert_token_nums
+        else:
+            raise NotImplementedError(f"Not support fuse_mode:{fuse_mode}")

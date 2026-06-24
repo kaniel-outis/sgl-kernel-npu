@@ -114,6 +114,11 @@ public:
             .DataType({ge::DT_BF16, ge::DT_FLOAT16, ge::DT_BF16, ge::DT_FLOAT16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
+        this->Output("combine_send_cost_stats")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
 
         this->Attr("group_ep").AttrType(REQUIRED).String();
         this->Attr("ep_world_size").AttrType(REQUIRED).Int();
@@ -146,6 +151,9 @@ public:
             .ExtendCfgInfo("jitCompile.flag", "static_true")
             .ExtendCfgInfo("multiKernelSupportDynamicGraph.value", "multi_kernel");
 
+#ifdef __DAV_C310__
+        this->AICore().AddConfig("ascend950", aicore_config);
+#endif
         this->AICore().AddConfig("ascend910_93", aicore_config);
         this->MC2().HcclGroup({"group_ep", "group_tp"});
     }

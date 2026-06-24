@@ -21,6 +21,8 @@
 #include "mc2_tiling_utils.h"
 #include "../op_kernel/cam_moe_combine_normal_tiling.h"
 #include "tiling_args.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/hccl/hccl_tiling.h"
 
 using namespace AscendC;
 using namespace ge;
@@ -31,7 +33,8 @@ constexpr uint32_t RECV_X_INDEX = 0;
 constexpr uint32_t TOKEN_SRC_INFO_INDEX = 1;
 constexpr uint32_t EP_RECV_COUNTS_INDEX = 2;
 constexpr uint32_t TOPK_WEIGHTS_INDEX = 3;
-constexpr uint32_t TP_RECV_COUNTS_INDEX = 4;
+constexpr uint32_t TOKEN_IDX_INDEX = 4;
+constexpr uint32_t TP_RECV_COUNTS_INDEX = 5;
 constexpr uint32_t OUTPUT_X_INDEX = 0;
 constexpr uint32_t OUTPUT_SEND_COST_INDEX = 1;
 
@@ -45,6 +48,7 @@ constexpr uint32_t ATTR_MOE_EXPERT_NUM_INDEX = 6;
 constexpr uint32_t ATTR_REAL_MAX_BS_INDEX = 7;
 constexpr uint32_t ATTR_MAX_ROUND_INDEX = 8;
 constexpr uint32_t ATTR_PER_ROUND_TOKENS_INDEX = 9;
+constexpr uint32_t OP_TYPE_ALL_GATHER = 6;
 
 constexpr uint32_t TWO_DIMS = 2U;
 constexpr uint32_t ONE_DIM = 1U;
@@ -55,14 +59,14 @@ constexpr size_t MAX_GROUP_NAME_LENGTH = 128UL;
 constexpr int64_t MAX_EP_WORLD_SIZE = 384;
 constexpr int64_t MIN_EP_WORLD_SIZE = 2;
 constexpr int64_t MAX_TP_WORLD_SIZE = 2;
-constexpr int64_t BS_UPPER_BOUND = 32768;
+constexpr int64_t BS_UPPER_BOUND = 131072;
 
 constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
 constexpr int32_t HCCL_BUFFER_SIZE_DEFAULT = 200 * 1024 * 1024;  // Bytes
-constexpr int64_t MOE_EXPERT_MAX_NUM = 512;
+constexpr int64_t MOE_EXPERT_MAX_NUM = 1024;
 constexpr int64_t K_MAX = 16;
 constexpr int64_t H_MIN = 1024;
-constexpr int64_t H_MAX = 7168;
+constexpr int64_t H_MAX = 8192;
 constexpr uint64_t MB_SIZE = 1024UL * 1024UL;
 constexpr uint64_t TRIPLE = 3;
 constexpr uint64_t WIN_ADDR_ALIGN = 512UL;
@@ -72,6 +76,9 @@ constexpr uint64_t MAX_OUT_DTYPE_SIZE = 2UL;
 constexpr uint64_t UB_ALIGN = 32UL;
 constexpr int64_t DISPATCH_STATUS_MAX_SUPPORT_NUM = 1280UL;
 constexpr uint64_t INIT_TILINGKEY = 10000UL;
+constexpr uint64_t TILING_KEY_A5_TYPE = 5000UL;
+constexpr uint64_t TILING_KEY_A3_TYPE = 3000UL;
+constexpr uint64_t TILING_KEY_A2_TYPE = 2000UL;
 
 enum class CommQuantMode : int32_t { NON_QUANT = 0, INT12_QUANT = 1, INT8_QUANT = 2 };
 using CommQuantModeType = std::underlying_type<CommQuantMode>;
@@ -207,6 +214,15 @@ static bool CheckInputTensorDim(gert::TilingContext *context, const char *nodeNa
     OP_LOGD(nodeName, "topkWeights dim0 = %ld", topkWeightsStorageShape->GetStorageShape().GetDim(0));
     OP_LOGD(nodeName, "topkWeights dim1 = %ld", topkWeightsStorageShape->GetStorageShape().GetDim(1));
 
+    const gert::StorageShape *tokenIdxStorageShape = context->GetInputShape(TOKEN_IDX_INDEX);
+    OP_TILING_CHECK(tokenIdxStorageShape == nullptr, OP_LOGE(nodeName, "tokenIdx is null."), return false);
+    OP_TILING_CHECK(tokenIdxStorageShape->GetStorageShape().GetDimNum() != TWO_DIMS,
+                    OP_LOGE(nodeName, "tokenIdx must be 2-dimension, but got %lu dim",
+                            tokenIdxStorageShape->GetStorageShape().GetDimNum()),
+                    return false);
+    OP_LOGD(nodeName, "tokenIdx dim0 = %ld", tokenIdxStorageShape->GetStorageShape().GetDim(0));
+    OP_LOGD(nodeName, "tokenIdx dim1 = %ld", tokenIdxStorageShape->GetStorageShape().GetDim(1));
+
     return true;
 }
 
@@ -285,6 +301,10 @@ static bool CheckTensorDataType(gert::TilingContext *context, const char *nodeNa
     OP_TILING_CHECK((topkWeightsDesc->GetDataType() != ge::DT_FLOAT),
                     OP_LOGE(nodeName, "topkWeights dataType is invalid, dataType should be float, but is "),
                     return false);
+    auto tokenIdxDesc = context->GetInputDesc(TOKEN_IDX_INDEX);
+    OP_TILING_CHECK(tokenIdxDesc == nullptr, OP_LOGE(nodeName, "tokenIdxDesc is null."), return false);
+    OP_TILING_CHECK((tokenIdxDesc->GetDataType() != ge::DT_INT32),
+                    OP_LOGE(nodeName, "tokenIdx dataType is invalid, dataType should be int32, but is "), return false);
     auto xDesc = context->GetOutputDesc(OUTPUT_X_INDEX);
     OP_TILING_CHECK(xDesc == nullptr, OP_LOGE(nodeName, "xDesc is null."), return false);
     OP_TILING_CHECK((xDesc->GetDataType() != recvXDesc->GetDataType()),
@@ -328,6 +348,12 @@ static bool CheckTensorFormat(gert::TilingContext *context, const char *nodeName
     OP_TILING_CHECK(
         static_cast<ge::Format>(ge::GetPrimaryFormat(topkWeightsDesc->GetStorageFormat())) == ge::FORMAT_FRACTAL_NZ,
         OP_LOGE(nodeName, "topkWeightsFormat is invalid"), return false);
+
+    auto tokenIdxDesc = context->GetInputDesc(TOKEN_IDX_INDEX);
+    OP_TILING_CHECK(tokenIdxDesc == nullptr, OP_LOGE(nodeName, "tokenIdxDesc is null."), return false);
+    OP_TILING_CHECK(
+        static_cast<ge::Format>(ge::GetPrimaryFormat(tokenIdxDesc->GetStorageFormat())) == ge::FORMAT_FRACTAL_NZ,
+        OP_LOGE(nodeName, "tokenIdxFormat is invalid"), return false);
 
     auto xDesc = context->GetOutputDesc(OUTPUT_X_INDEX);
     OP_TILING_CHECK(xDesc == nullptr, OP_LOGE(nodeName, "xDesc is null."), return false);
@@ -415,7 +441,7 @@ static bool CheckAttrs(gert::TilingContext *context, CamMoeCombineNormalTilingDa
     // 校验输入topkWeights的维度0并设bs
     const gert::StorageShape *topkWeightsStorageShape = context->GetInputShape(TOPK_WEIGHTS_INDEX);
     int64_t topkWeightsDim0 = topkWeightsStorageShape->GetStorageShape().GetDim(0);
-    OP_TILING_CHECK((topkWeightsDim0 <= 0) || (topkWeightsDim0 > BS_UPPER_BOUND),
+    OP_TILING_CHECK((topkWeightsDim0 < 0) || (topkWeightsDim0 > BS_UPPER_BOUND),
                     OP_LOGE(nodeName, "Invalid topkWeights dims0(BS) %ld. Should be between [1, %ld].", topkWeightsDim0,
                             BS_UPPER_BOUND),
                     return false);
@@ -480,11 +506,13 @@ static void SetHCommCfg(gert::TilingContext *context, CamMoeCombineNormalTilingD
     const char *nodeName = context->GetNodeName();
     OP_LOGD(nodeName, "CamMoeCombineNormal groupEp = %s, groupTp = %s", groupEp.c_str(), groupTp.c_str());
     uint32_t opType1 = OP_TYPE_ALL_TO_ALL;
-    uint32_t opType2 = OP_TYPE_REDUCE_SCATTER;
+    uint32_t opType2 = OP_TYPE_ALL_GATHER;
     std::string algConfigAllToAllStr = "AlltoAll=level0:fullmesh;level1:pairwise";
-    std::string algConfigReduceScatterStr = "ReduceScatter=level0:ring";
+    std::string algConfigReduceScatterStr = "AllGather=level0:ring";
 
     AscendC::Mc2CcTilingConfig mc2CcTilingConfig(groupEp, opType1, algConfigAllToAllStr);
+
+    mc2CcTilingConfig.SetCommEngine(mc2tiling::AIV_ENGINE);  // 通过不拉起AICPU，提高算子退出性能
     mc2CcTilingConfig.GetTiling(tiling->mc2InitTiling);
     mc2CcTilingConfig.GetTiling(tiling->mc2CcTiling1);
 
@@ -533,8 +561,10 @@ static ge::graphStatus CamMoeCombineNormalA3TilingFuncImpl(gert::TilingContext *
     uint64_t perRoundTokens = tilingData->camMoeCombineNormalInfo.perRoundTokens;
     uint64_t realMaxBs = tilingData->camMoeCombineNormalInfo.realMaxBs;
     uint64_t realBs = std::min(perRoundTokens, realMaxBs);
+    uint32_t maxRound = tilingData->camMoeCombineNormalInfo.maxRound;
     // combine数据区 token首地址对齐512
     uint64_t tokenNeedSizeCombine = ((h * MAX_OUT_DTYPE_SIZE + WIN_ADDR_ALIGN - 1UL) / WIN_ADDR_ALIGN) * WIN_ADDR_ALIGN;
+    tokenNeedSizeCombine = maxRound > 1 ? tokenNeedSizeCombine * 2 : tokenNeedSizeCombine;
     uint64_t actualSize = (realBs * k * tokenNeedSizeCombine + COMBINE_STATE_WIN_OFFSET + NOTIFY_DISPATCH_WIN_OFFSET) *
                           DOUBLE_DATA_BUFFER;
     OP_TILING_CHECK(
@@ -542,7 +572,7 @@ static ge::graphStatus CamMoeCombineNormalA3TilingFuncImpl(gert::TilingContext *
         OP_LOGE(nodeName,
                 "HCCL_BUFFSIZE is too SMALL, realBs = %lu, h = %lu, epWorldSize = %lu, localMoeExpertNum = %u,"
                 " tokenNeedSizeCombine = %lu, k = %lu, NEEDED_HCCL_BUFFSIZE("
-                "((realBs * k * tokenNeedSizeCombine)) + 4MB + 204MB) * 2) = %luMB, "
+                "((realBs * k * tokenNeedSizeCombine * 2)) + 4MB + 204MB) * 2) = %luMB, "
                 "HCCL_BUFFSIZE=%luMB.",
                 realBs, h, epWorldSize, localMoeExpertNum, tokenNeedSizeCombine, k, actualSize / MB_SIZE + 1UL,
                 maxWindowSize / MB_SIZE),
@@ -571,10 +601,21 @@ static ge::graphStatus CamMoeCombineNormalA3TilingFuncImpl(gert::TilingContext *
     PrintTilingDataInfo(nodeName, *tilingData);
 
     uint64_t tilingKey = INIT_TILINGKEY;
-    uint32_t maxRound = tilingData->camMoeCombineNormalInfo.maxRound;
     if (maxRound > 1) {
         tilingKey += 1;
     }
+
+    fe::PlatFormInfos *platformInfoPtr = context->GetPlatformInfo();
+    fe::PlatFormInfos &platformInfo = *platformInfoPtr;
+    std::string socVersion;
+    (void)platformInfo.GetPlatformResWithLock("version", "Short_SoC_version", socVersion);
+
+    if (socVersion == "Ascend950") {
+        tilingKey = tilingKey + TILING_KEY_A5_TYPE;
+    } else {
+        tilingKey = tilingKey + TILING_KEY_A3_TYPE;
+    }
+
     OP_LOGD(nodeName, "tilingKey is %lu", tilingKey);
     context->SetTilingKey(tilingKey);
 

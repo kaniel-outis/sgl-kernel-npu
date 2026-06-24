@@ -211,13 +211,10 @@ __aicore__ inline void MoeDistributeDispatchV2Layered<TemplateMC2TypeA2layeredFu
 {
     tpipe_ = pipe;
     REGISTER_TILING_DEFAULT(MoeDistributeDispatchV2TilingData);
-    auto tiling = (__gm__ MoeDistributeDispatchV2TilingData *)tilingGM;
-    __gm__ void *mc2InitTiling = (__gm__ void *)(&(tiling->mc2InitTiling));
-    __gm__ void *mc2CcTiling = (__gm__ void *)(&(tiling->mc2CcTiling));
     GET_TILING_DATA_WITH_STRUCT(MoeDistributeDispatchV2TilingData, tilingData, tilingGM);
 
-    hccl_.Init(contextGM0, mc2InitTiling);
-    hccl_.SetCcTiling(mc2CcTiling);
+    hccl_.InitV2(contextGM0, &tilingData);
+    hccl_.SetCcTilingV2(offsetof(MoeDistributeDispatchV2TilingData, mc2CcTiling));
 
     winContext_ = (__gm__ HcclA2CombineOpParam *)contextGM0;
     rankId_ = tilingData.moeDistributeDispatchV2Info.epRankId;
@@ -1283,7 +1280,6 @@ __aicore__ inline void MoeDistributeDispatchV2Layered<TemplateMC2TypeA2layeredFu
     LocalTensor<uint8_t> localUB = tBuf.GetWithOffset<uint8_t>(tokenUbSize_ / sizeof(uint8_t), TBUF_TEMP_OFFSET);
     LocalTensor<float> localUBfloat = tBuf.GetWithOffset<float>(tokenUbSize_ / sizeof(float), TBUF_TEMP_OFFSET);
     LocalTensor<int32_t> localUBint32 = tBuf.GetWithOffset<int32_t>(tokenUbSize_ / sizeof(int32_t), TBUF_TEMP_OFFSET);
-
     int32_t sumTokenCnt = (0 == srPreCnt) ? 0 : tokenCntUB(srPreCnt - 1);
     for (uint32_t idx = 0; idx < srCntCurCore; ++idx) {
         // 循环本Core需要处理的Rank数

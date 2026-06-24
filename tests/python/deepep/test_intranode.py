@@ -1,5 +1,6 @@
 import argparse
 import os
+import random
 import time
 from typing import Optional
 
@@ -30,11 +31,39 @@ def test_main(
     group: dist.ProcessGroup,
 ):
     # Settings
-    num_tokens, hidden = args.num_tokens, args.hidden
+    base_num_tokens, hidden = args.num_tokens, args.hidden
     num_topk, num_experts = args.num_topk, args.num_experts
     enable_diagnose = args.enable_diagnose
+    enable_dynamic_tokens = args.enable_dynamic_tokens
+    quant_type = args.quant_type  # no, int8, fp8, fp4
+    if quant_type == "no":
+        quant_type_tensor = None
+    elif quant_type == "int8":
+        quant_type_tensor = torch.tensor([], dtype=torch.int8, device="npu")
+    elif quant_type == "fp8":
+        quant_type_tensor = torch.tensor([], dtype=torch.float8_e4m3fn, device="npu")
+    elif quant_type == "fp4":
+        quant_type_tensor = torch.tensor([], dtype=torch.float4_e2m1fn_x2, device="npu")
     num_servers = num_ranks // num_local_ranks
     expert_token_nums_type = int(os.getenv("MOE_EXPERT_TOKEN_NUMS_TYPE", 1))
+
+    if enable_dynamic_tokens:
+        fluctuation_percentage = 0.1
+        min_fluctuation = 2
+
+        if base_num_tokens < 10:
+            fluctuation = random.randint(-min_fluctuation, min_fluctuation)
+            num_tokens = base_num_tokens + fluctuation
+        else:
+            fluctuation = random.uniform(
+                1 - fluctuation_percentage, 1 + fluctuation_percentage
+            )
+            num_tokens = int(base_num_tokens * fluctuation)
+
+        # Ensure num_tokens is at least 1
+        num_tokens = max(num_tokens, 1)
+    else:
+        num_tokens = base_num_tokens
 
     assert num_experts % num_ranks == 0
     if local_rank == 0:
@@ -90,6 +119,41 @@ def test_main(
             + 1
         )
         topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+
+    topk_weights = (
+        torch.ones((num_tokens, num_topk), dtype=torch.float32, device="npu") * rank
+    )
+
+    if args.topk_drop_prob > 0 or args.topk_drop_row >= 0:
+        topk_idx_dropped = topk_idx.clone()
+        topk_weights_dropped = topk_weights.clone()
+
+        # Random drop (based on probability)
+        if args.topk_drop_prob > 0:
+            drop_mask = (
+                torch.rand_like(topk_idx, dtype=torch.float32) < args.topk_drop_prob
+            )
+            topk_idx_dropped = topk_idx.clone()
+            topk_idx_dropped = topk_idx_dropped.masked_fill(drop_mask, -1)
+
+            # Construct topk_weights_dropped
+            invalid_mask = topk_idx_dropped == -1
+            topk_weights_dropped = topk_weights_dropped.masked_fill(invalid_mask, 0.0)
+
+        # Fixed column drop (for the test_topk_minus1 scenario)
+        if args.topk_drop_row >= 0 and args.topk_drop_row < num_tokens:
+            topk_idx_dropped[args.topk_drop_row, :] = -1
+            topk_weights_dropped[args.topk_drop_row, :] = 0
+
+        # print drop ratio
+        drop_ratio = (topk_idx_dropped == -1).float().mean().item()
+        if rank == 0:
+            print(
+                f"[DEBUG] [rank {rank}] topk dropped ratio = {drop_ratio*100:.2f}%",
+                flush=True,
+            )
+        topk_idx = topk_idx_dropped
+        topk_weights = topk_weights_dropped
 
     rank_idx = topk_idx // experts_per_rank
     rank_idx.masked_fill_(topk_idx == -1, -1)
@@ -151,15 +215,15 @@ def test_main(
     token_idx_in_rank = torch.full(
         (num_ranks, num_tokens), -1, dtype=torch.long, device="npu"
     )
+
     for i in range(num_ranks):
-        num_tokens_per_rank[i] = (rank_idx == i).sum()
-        token_sel = (rank_idx == i).max(dim=-1)[0]
-        count = token_sel.sum().item()
-        tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
-        tokens[:count] = torch.sort(tokens[:count])[0]
-        token_idx_in_rank[i][tokens[:count]] = torch.arange(
-            count, dtype=torch.long, device="npu"
-        )
+        token_sel = (rank_idx == i).max(dim=-1)[0]  # [num_tokens]
+        token_indices = torch.nonzero(token_sel, as_tuple=True)[0]  # [count]
+        count = token_indices.numel()
+        num_tokens_per_rank[i] = count
+        if count > 0:
+            token_idx_in_rank[i][token_indices] = torch.arange(count, device="npu")
+
     token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
     is_token_in_rank = (token_idx_in_rank >= 0).to(torch.int)
     gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
@@ -224,7 +288,11 @@ def test_main(
     ):
         for current_x in filter(lambda elem: elem is not None, (x_pure_rand,)):
             dispatch_args = {
-                "x": current_x,
+                "x": (
+                    current_x
+                    if quant_type_tensor is None
+                    else (current_x, quant_type_tensor)
+                ),
                 "num_tokens_per_rank": ref_num_tokens_per_rank,
                 "is_token_in_rank": ref_is_token_in_rank,
                 "num_tokens_per_expert": ref_num_tokens_per_expert,
@@ -244,6 +312,7 @@ def test_main(
                     handle,
                     event,
                 ) = buffer.dispatch(**dispatch_args)
+
                 recv_x = (
                     per_token_cast_back(*recv_x)
                     if isinstance(recv_x, tuple)
@@ -289,7 +358,11 @@ def test_main(
                 flush=True,
             )
         dispatch_args = {
-            "x": current_x,
+            "x": (
+                current_x
+                if quant_type_tensor is None
+                else (current_x, quant_type_tensor)
+            ),
             "num_tokens_per_rank": ref_num_tokens_per_rank,
             "is_token_in_rank": ref_is_token_in_rank,
             "num_tokens_per_expert": ref_num_tokens_per_expert,
@@ -308,6 +381,16 @@ def test_main(
             handle,
             event,
         ) = buffer.dispatch(**dispatch_args)
+        recv_x_original = (
+            recv_x[0].view(torch.uint8).clone().view(recv_x[0].dtype)
+            if isinstance(recv_x, tuple)
+            else recv_x.clone()
+        )
+        quant_scales = (
+            recv_x[1].view(torch.uint8).clone().view(recv_x[1].dtype)
+            if isinstance(recv_x, tuple)
+            else None
+        )
         recv_x = per_token_cast_back(*recv_x) if isinstance(recv_x, tuple) else recv_x
 
         # Checks
@@ -341,11 +424,19 @@ def test_main(
         }
         combined_x, combined_topk_weights, event = buffer.combine(**combine_args)
         check_x = combined_x.float()
+
         ref_x = x_pure_rand if current_x is x_pure_rand else x
         diff = calc_diff(
             check_x,
             ref_x * handle[7].masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1),
         )
+        golden = ref_x * handle[7].masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1)
+        # translate all zeros to eps in golden
+        eps = 1e-8
+        golden_nozero = torch.where(golden == 0, eps, golden)
+        max_diff = torch.max(torch.abs(check_x - golden) / golden_nozero).item()
+        avg_diff = torch.mean(torch.abs(check_x - golden) / golden_nozero).item()
+        print(f"{rank=}, {avg_diff=:.5f}, {max_diff=:.5f}, cosine_diff={diff:.5f}")
         assert diff < 5e-5
 
         # For later tuning
@@ -368,7 +459,11 @@ def test_main(
         )
 
         tune_args = {
-            "x": current_x,
+            "x": (
+                current_x
+                if quant_type_tensor is None
+                else (current_x, quant_type_tensor)
+            ),
             "config": config,
             "num_tokens_per_rank": ref_num_tokens_per_rank,
             "is_token_in_rank": ref_is_token_in_rank,
@@ -386,7 +481,7 @@ def test_main(
             print("", flush=True)
 
     dispatch_args = {
-        "x": x,
+        "x": x if quant_type_tensor is None else (x, quant_type_tensor),
         "num_tokens_per_rank": ref_num_tokens_per_rank,
         "is_token_in_rank": ref_is_token_in_rank,
         "num_tokens_per_expert": ref_num_tokens_per_expert,
@@ -476,6 +571,32 @@ if __name__ == "__main__":
         "--enable-diagnose",
         action="store_true",
         help="Whether to enable diagnose for testing",
+    )
+    parser.add_argument(
+        "--topk-drop-prob",
+        dest="topk_drop_prob",
+        type=float,
+        default=0.0,
+        help="Probability of randomly dropping a top-k index (set to -1).",
+    )
+    parser.add_argument(
+        "--topk-drop-row",
+        dest="topk_drop_row",
+        type=int,
+        default=-1,
+        help="If >=0, drop this specific top-k column (set index to -1 for testing).",
+    )
+    parser.add_argument(
+        "--enable-dynamic-tokens",
+        action="store_true",
+        help="Whether to enable dynamic tokens for testing",
+    )
+    parser.add_argument(
+        "--quant-type",
+        dest="quant_type",
+        type=str,
+        default="no",
+        help="quant type: no, int8, fp8, fp4",
     )
     args = parser.parse_args()
 

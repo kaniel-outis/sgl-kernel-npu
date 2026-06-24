@@ -272,14 +272,11 @@ __aicore__ inline void MoeDistributeDispatchV2Single<TemplateMC2TypeA2SingleFunc
     aivId_ = GetBlockIdx();
 
     REGISTER_TILING_DEFAULT(MoeDistributeDispatchV2TilingData);
-    auto tiling = (__gm__ MoeDistributeDispatchV2TilingData *)tilingGM;
-    __gm__ void *mc2InitTiling = (__gm__ void *)(&(tiling->mc2InitTiling));
-    __gm__ void *mc2CcTiling = (__gm__ void *)(&(tiling->mc2CcTiling));
     GET_TILING_DATA_WITH_STRUCT(MoeDistributeDispatchV2TilingData, tilingData, tilingGM);
 
     auto contextGM0 = AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
-    hccl_.Init(contextGM0, mc2InitTiling);
-    hccl_.SetCcTiling(mc2CcTiling);
+    hccl_.InitV2(contextGM0, &tilingData);
+    hccl_.SetCcTilingV2(offsetof(MoeDistributeDispatchV2TilingData, mc2CcTiling));
 
     winContext_[COMM_EP_IDX] = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
     winContext_[COMM_TP_IDX] = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<1>();  // 没有相关公共宏
@@ -798,11 +795,11 @@ __aicore__ inline void MoeDistributeDispatchV2Single<TemplateMC2TypeA2SingleFunc
     CAM_PRINT("[AlltoAllDispatch1] rank:%d, aivId:%d ...\n", epRankId_, aivId_);
     activeMaskBsCnt_ = axisBS_;
     sendToMoeExpTokenCnt_ = axisBS_ * axisK_;
-    if (isTokenMaskFlag_) {
+    if (axisBS_ != 0 && isTokenMaskFlag_) {
         TokenActiveMaskCal();
     }
     CAM_PRINT("[AlltoAllDispatch2] rank:%d, aivId:%d, isTokenMaskFlag_:%d ...\n", epRankId_, aivId_, isTokenMaskFlag_);
-    if (isExpertMaskFlag_) {
+    if (axisBS_ != 0 && isExpertMaskFlag_) {
         ExpertActiveMaskCal();
     }
     CAM_PRINT("[AlltoAllDispatch3] rank:%d, aivId:%d, isExpertMaskFlag_:%d ...\n", epRankId_, aivId_,
